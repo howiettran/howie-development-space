@@ -404,7 +404,7 @@ final class ExportManager {
     private Uri copyToDownloads(File source, String displayName, String mimeType, boolean audio) throws IOException {
         ContentResolver resolver = context.getContentResolver();
         String selectedTree = context.getSharedPreferences("howie_translate", Context.MODE_PRIVATE)
-                .getString("export_tree_uri", "");
+                .getString(audio ? "mp3_export_tree_uri" : "mp4_export_tree_uri", "");
         if (selectedTree != null && !selectedTree.trim().isEmpty()) {
             Uri treeUri = Uri.parse(selectedTree);
             Uri parent = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri));

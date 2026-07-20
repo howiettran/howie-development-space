@@ -11,6 +11,7 @@ import java.util.List;
 
 final class AppDatabase extends SQLiteOpenHelper {
     static final String HISTORY_ONLY_MARKER = "\u200B\u200C\u200D";
+    static final String SAVED_COPY_MARKER = "[SAVED_COPY]";
     private static final String DB_NAME = "howie_translate.db";
     private static final int DB_VERSION = 3;
 
@@ -150,12 +151,12 @@ final class AppDatabase extends SQLiteOpenHelper {
 
     List<Models.RecordingItem> getHistory(String query) {
         String q = query == null ? "" : query.trim();
-        String selection = null;
-        String[] args = null;
+        String selection = "notes NOT LIKE ?";
+        String[] args = new String[]{"%" + SAVED_COPY_MARKER + "%"};
         if (!q.isEmpty()) {
-            selection = "title LIKE ? OR category LIKE ? OR transcript LIKE ? OR translation LIKE ? OR notes LIKE ?";
+            selection = "(title LIKE ? OR category LIKE ? OR transcript LIKE ? OR translation LIKE ? OR notes LIKE ?) AND notes NOT LIKE ?";
             String like = "%" + q + "%";
-            args = new String[]{like, like, like, like, like};
+            args = new String[]{like, like, like, like, like, "%" + SAVED_COPY_MARKER + "%"};
         }
         Cursor c = getReadableDatabase().query("recordings", null, selection, args, null, null,
                 "CASE WHEN sort_order=0 THEN 1 ELSE 0 END, sort_order ASC, created_at DESC");

@@ -11,8 +11,8 @@ android {
         minSdk 26
         targetSdk 35
         ndk { abiFilters 'arm64-v8a' }
-        versionCode 14
-        versionName '0.8.0-saved-ocr-history'
+        versionCode 15
+        versionName '0.8.1-storage-ocr-audio-link-fix'
     }
 
     def keystoreProperties = new Properties()
@@ -72,6 +72,7 @@ dependencies {
     implementation 'com.google.mlkit:translate:17.0.3'
     implementation 'com.google.mlkit:language-id:17.0.6'
     implementation 'com.google.mlkit:text-recognition:16.0.1'
+    implementation 'androidx.core:core:1.15.0'
     implementation 'com.belerweb:pinyin4j:2.5.1'
     implementation 'dev.ffmpegkit-maintained:whisper-android:1.0.0'
     implementation files('libs/ffmpeg-kit-audio-8.1.7.aar')
