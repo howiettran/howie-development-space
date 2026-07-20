@@ -1,0 +1,15 @@
+HOW TO UPLOAD AND BUILD THE APK
+
+1. Install GitHub Desktop from https://desktop.github.com/ and sign in.
+2. On your GitHub repository page, click "Set up in Desktop".
+3. Choose a folder on your computer and click "Clone".
+4. Extract this ZIP. Open the "howie_translate_src" folder.
+5. Copy everything inside "howie_translate_src" into the cloned repository folder.
+6. Return to GitHub Desktop. Enter summary: Add Howie Translate v0.8.0
+7. Click "Commit to main", then click "Push origin".
+8. Open the repository in your browser and click the "Actions" tab.
+9. Open "Build Howie Translate APK" and wait for a green tick.
+10. Open the completed run. Under "Artifacts", click "Howie-Translate-v0.8.0-test-APK".
+11. Unzip the downloaded artifact and install the APK on your Android phone.
+
+Note: This test APK uses Android's debug signing key. You may need to uninstall a differently signed older beta before installing it.

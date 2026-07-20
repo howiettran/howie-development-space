@@ -1,0 +1,78 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'au.com.transpired.howietranslate'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'au.com.transpired.howietranslate'
+        minSdk 26
+        targetSdk 35
+        ndk { abiFilters 'arm64-v8a' }
+        versionCode 14
+        versionName '0.8.0-saved-ocr-history'
+    }
+
+    def keystoreProperties = new Properties()
+    def keystorePropertiesFile = rootProject.file('keystore.properties')
+    if (keystorePropertiesFile.exists()) {
+        keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+    }
+
+    def hasReleaseSigning = keystorePropertiesFile.exists()
+            && keystoreProperties['storeFile']
+            && keystoreProperties['storePassword']
+            && keystoreProperties['keyAlias']
+            && keystoreProperties['keyPassword']
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile rootProject.file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            if (hasReleaseSigning) signingConfig signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    androidResources {
+        noCompress 'bin'
+    }
+
+    packaging {
+        jniLibs {
+            pickFirsts += ['lib/arm64-v8a/libc++_shared.so']
+        }
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'com.google.mlkit:translate:17.0.3'
+    implementation 'com.google.mlkit:language-id:17.0.6'
+    implementation 'com.google.mlkit:text-recognition:16.0.1'
+    implementation 'com.belerweb:pinyin4j:2.5.1'
+    implementation 'dev.ffmpegkit-maintained:whisper-android:1.0.0'
+    implementation files('libs/ffmpeg-kit-audio-8.1.7.aar')
+}
