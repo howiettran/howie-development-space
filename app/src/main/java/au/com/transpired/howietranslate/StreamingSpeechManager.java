@@ -363,7 +363,7 @@ final class StreamingSpeechManager {
                 // Accuracy fix: Whisper Tiny is far more reliable when the selected speaker
                 // language is passed explicitly. "auto" was allowing unrelated scripts and
                 // languages to leak into Vietnamese and English transcripts.
-                String whisperLanguage = phrase.hintedLanguage;
+                String whisperLanguage = LanguageSupport.whisperCode(phrase.hintedLanguage);
                 WhisperConfig config = new WhisperConfig(
                         whisperLanguage,
                         false,
@@ -489,7 +489,12 @@ final class StreamingSpeechManager {
     private String resolveLanguage(String text, String hintedLanguage, String otherLanguage) {
         if (otherLanguage == null || otherLanguage.equals(hintedLanguage)) return hintedLanguage;
         if (containsHan(text)) {
-            if ("zh".equals(hintedLanguage) || "zh".equals(otherLanguage)) return "zh";
+            if (LanguageSupport.isChineseScript(hintedLanguage)) return hintedLanguage;
+            if (LanguageSupport.isChineseScript(otherLanguage)) return otherLanguage;
+        }
+        if (containsThai(text)) {
+            if ("th".equals(hintedLanguage)) return hintedLanguage;
+            if ("th".equals(otherLanguage)) return otherLanguage;
         }
         try {
             List<IdentifiedLanguage> candidates = Tasks.await(
@@ -514,8 +519,10 @@ final class StreamingSpeechManager {
     private static String normaliseIdentifiedLanguage(String tag) {
         if (tag == null) return "";
         String lower = tag.toLowerCase(Locale.ROOT);
-        if (lower.startsWith("zh")) return "zh";
+        if (lower.startsWith("zh") || lower.startsWith("yue")) return "zh";
         if (lower.startsWith("vi")) return "vi";
+        if (lower.startsWith("th")) return "th";
+        if (lower.startsWith("ms") || lower.startsWith("id")) return "ms";
         if (lower.startsWith("en")) return "en";
         return lower;
     }
@@ -525,6 +532,16 @@ final class StreamingSpeechManager {
         for (int i = 0; i < text.length(); i++) {
             Character.UnicodeScript script = Character.UnicodeScript.of(text.charAt(i));
             if (script == Character.UnicodeScript.HAN) return true;
+        }
+        return false;
+    }
+
+    private static boolean containsThai(String text) {
+        if (text == null) return false;
+        for (int offset = 0; offset < text.length();) {
+            int codePoint = text.codePointAt(offset);
+            offset += Character.charCount(codePoint);
+            if (Character.UnicodeScript.of(codePoint) == Character.UnicodeScript.THAI) return true;
         }
         return false;
     }
@@ -624,7 +641,7 @@ final class StreamingSpeechManager {
             // or Cyrillic output and protects Chinese sessions from unrelated Asian scripts.
             return "";
         }
-        if ("zh".equals(language)) {
+        if (LanguageSupport.isChineseScript(language)) {
             // Whisper sometimes inserts spaces between every Han character. Preserve spaces around Latin words.
             text = text.replaceAll("(?<=\\p{IsHan})\\s+(?=\\p{IsHan})", "");
         }
@@ -633,18 +650,11 @@ final class StreamingSpeechManager {
 
     private static boolean containsUnexpectedScript(String text, String language) {
         if (text == null || text.isEmpty()) return false;
-        boolean chinese = "zh".equals(language);
         for (int offset = 0; offset < text.length();) {
             int codePoint = text.codePointAt(offset);
             offset += Character.charCount(codePoint);
             Character.UnicodeScript script = Character.UnicodeScript.of(codePoint);
-            if (script == Character.UnicodeScript.COMMON
-                    || script == Character.UnicodeScript.INHERITED
-                    || script == Character.UnicodeScript.LATIN) {
-                continue;
-            }
-            if (chinese && script == Character.UnicodeScript.HAN) continue;
-            return true;
+            if (!LanguageSupport.acceptsScript(language, script)) return true;
         }
         return false;
     }
@@ -756,8 +766,7 @@ final class StreamingSpeechManager {
     }
 
     private static String normalise(String language) {
-        if ("zh".equals(language) || "vi".equals(language)) return language;
-        return "en";
+        return LanguageSupport.normalise(language);
     }
 
     private static String safeMessage(Throwable e) {

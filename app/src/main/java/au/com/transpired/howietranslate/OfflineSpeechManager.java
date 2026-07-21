@@ -15,8 +15,8 @@ import java.util.Map;
  * Describes the speech capability bundled with the app.
  *
  * Howie Translate now ships one multilingual Whisper model inside the APK. The same private
- * model recognises English, Mandarin Chinese and Vietnamese, so there are no separate speech
- * downloads and no Google/Samsung speech-service dependency.
+ * model recognises multiple languages, so there are no separate speech downloads and no
+ * Google/Samsung speech-service dependency when Offline Whisper is selected.
  */
 public final class OfflineSpeechManager {
     static final String WHISPER_ASSET_PATH = "models/ggml-tiny.bin";
@@ -41,8 +41,12 @@ public final class OfflineSpeechManager {
     static {
         Map<String, ModelInfo> items = new HashMap<>();
         items.put("en", new ModelInfo("en", "English"));
-        items.put("zh", new ModelInfo("zh", "中文"));
-        items.put("vi", new ModelInfo("vi", "Tiếng Việt"));
+        items.put("zh", new ModelInfo("zh", "Mandarin Chinese"));
+        items.put("vi", new ModelInfo("vi", "Vietnamese"));
+        items.put("th", new ModelInfo("th", "Thai"));
+        items.put("ms", new ModelInfo("ms", "Malay"));
+        items.put("yue", new ModelInfo("yue", "Cantonese (best effort)"));
+        items.put("nan", new ModelInfo("nan", "Teo Chew (best effort)"));
         MODELS = Collections.unmodifiableMap(items);
     }
 
@@ -135,7 +139,6 @@ public final class OfflineSpeechManager {
     }
 
     private static String normalise(String language) {
-        if ("zh".equals(language) || "vi".equals(language)) return language;
-        return "en";
+        return LanguageSupport.normalise(language);
     }
 }

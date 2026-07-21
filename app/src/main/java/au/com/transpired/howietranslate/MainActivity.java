@@ -52,8 +52,10 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
 import com.google.mlkit.vision.text.TextRecognition;
 import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
 
 import java.io.File;
@@ -81,8 +83,8 @@ public class MainActivity extends Activity {
     private static final String SAVED_COPY_MARKER = "[SAVED_COPY]";
     private Uri pendingOcrCameraUri;
 
-    private static final String[] LANGUAGE_NAMES = {"English", "中文", "Tiếng Việt"};
-    private static final String[] LANGUAGE_CODES = {"en", "zh", "vi"};
+    private static final String[] LANGUAGE_NAMES = LanguageSupport.NAMES;
+    private static final String[] LANGUAGE_CODES = LanguageSupport.CODES;
 
     private final int BLUE = Color.rgb(18, 103, 215);
     private final int DARK_BLUE = Color.rgb(11, 63, 148);
@@ -104,8 +106,10 @@ public class MainActivity extends Activity {
     private GoogleOnlineSpeechManager googleOnlineSpeechManager;
     private ExportManager exportManager;
     private TextToSpeech tts;
-    private TextRecognizer textRecognizer;
+    private TextRecognizer latinTextRecognizer;
+    private TextRecognizer chineseTextRecognizer;
     private EditText activeOcrInput;
+    private String activeOcrSourceCode = "en";
     private boolean ttsReady;
 
     private SpeechResultConsumer speechConsumer;
@@ -201,7 +205,8 @@ public class MainActivity extends Activity {
         googleOnlineSpeechManager = new GoogleOnlineSpeechManager(this);
         exportManager = new ExportManager(this);
         tts = new TextToSpeech(this, status -> ttsReady = status == TextToSpeech.SUCCESS);
-        textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+        latinTextRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+        chineseTextRecognizer = TextRecognition.getClient(new ChineseTextRecognizerOptions.Builder().build());
         setContentView(buildShell());
         showPage("translate");
     }
@@ -217,7 +222,8 @@ public class MainActivity extends Activity {
         if (exportManager != null) exportManager.close();
         if (offlineSpeechManager != null) offlineSpeechManager.close();
         translationManager.close();
-        if (textRecognizer != null) textRecognizer.close();
+        if (latinTextRecognizer != null) latinTextRecognizer.close();
+        if (chineseTextRecognizer != null) chineseTextRecognizer.close();
         if (tts != null) {
             tts.stop();
             tts.shutdown();
@@ -321,7 +327,7 @@ public class MainActivity extends Activity {
 
     private View buildTranslatePage() {
         LinearLayout page = pageContainer();
-        page.addView(sectionTitle("Translate a phrase", "Type, paste or dictate in English, Chinese or Vietnamese."));
+        page.addView(sectionTitle("Translate a phrase", "Type, paste or dictate in English, Mandarin Chinese, Vietnamese, Thai, Malay, Cantonese or Teo Chew."));
 
         LinearLayout languageRow = horizontal();
         Spinner source = languageSpinner(0);
@@ -409,6 +415,7 @@ public class MainActivity extends Activity {
         }));
         captureImage.setOnClickListener(v -> {
             activeOcrInput = input;
+            activeOcrSourceCode = codeOf(source);
             try {
                 File cameraDir = new File(getCacheDir(), "ocr_camera");
                 if (!cameraDir.exists()) cameraDir.mkdirs();
@@ -426,6 +433,7 @@ public class MainActivity extends Activity {
         });
         uploadImage.setOnClickListener(v -> {
             activeOcrInput = input;
+            activeOcrSourceCode = codeOf(source);
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
             intent.setType("image/*");
@@ -447,8 +455,8 @@ public class MainActivity extends Activity {
             item.translatedText = translatedText;
             item.sourceLanguage = codeOf(source);
             item.targetLanguage = codeOf(target);
-            item.pinyin = "zh".equals(item.targetLanguage) ? PinyinUtil.toPinyin(translatedText)
-                    : ("zh".equals(item.sourceLanguage) ? PinyinUtil.toPinyin(original) : "");
+            item.pinyin = LanguageSupport.isChineseScript(item.targetLanguage) ? PinyinUtil.toPinyin(translatedText)
+                    : (LanguageSupport.isChineseScript(item.sourceLanguage) ? PinyinUtil.toPinyin(original) : "");
             showGlossaryEditor(item, true, () -> toast("Saved to your glossary."));
         });
 
@@ -581,7 +589,8 @@ public class MainActivity extends Activity {
             item.translatedText = removeTranscriptLabels(translated);
             item.sourceLanguage = codeOf(conversationSource);
             item.targetLanguage = codeOf(conversationTarget);
-            String chinese = "zh".equals(item.targetLanguage) ? translated : ("zh".equals(item.sourceLanguage) ? original : "");
+            String chinese = LanguageSupport.isChineseScript(item.targetLanguage) ? translated
+                    : (LanguageSupport.isChineseScript(item.sourceLanguage) ? original : "");
             item.pinyin = PinyinUtil.toPinyin(removeTranscriptLabels(chinese));
             item.category = clean(conversationCategory.getText().toString(), "Conversations");
             showGlossaryEditor(item, true, () -> toast("Saved to your glossary."));
@@ -890,7 +899,7 @@ public class MainActivity extends Activity {
 
         LinearLayout modelCard = card();
         modelCard.addView(text("Offline translation models", 19, TEXT, true));
-        modelCard.addView(text("Download the English, Chinese and Vietnamese translation models once while connected to Wi-Fi. Typed translation can then run on the phone without an internet connection.", 14, MUTED, false), marginTop(matchWrap(), 6));
+        modelCard.addView(text("Download English, Mandarin Chinese, Vietnamese, Thai and Malay once. Cantonese and Teo Chew share the Chinese writing model. Translation then runs on the phone without an internet connection.", 14, MUTED, false), marginTop(matchWrap(), 6));
         TextView modelStatus = text("Not checked yet", 13, DARK_BLUE, true);
         Button download = button("Download all translation models", true);
         modelCard.addView(modelStatus, marginTop(matchWrap(), 10));
@@ -908,6 +917,10 @@ public class MainActivity extends Activity {
         speechCard.addView(buildSpeechModelRow("en"), marginTop(matchWrap(), 12));
         speechCard.addView(buildSpeechModelRow("zh"), marginTop(matchWrap(), 8));
         speechCard.addView(buildSpeechModelRow("vi"), marginTop(matchWrap(), 8));
+        speechCard.addView(buildSpeechModelRow("th"), marginTop(matchWrap(), 8));
+        speechCard.addView(buildSpeechModelRow("ms"), marginTop(matchWrap(), 8));
+        speechCard.addView(buildSpeechModelRow("yue"), marginTop(matchWrap(), 8));
+        speechCard.addView(buildSpeechModelRow("nan"), marginTop(matchWrap(), 8));
 
         LinearLayout testRow = horizontal();
         Spinner testLanguage = languageSpinner(1);
@@ -943,8 +956,8 @@ public class MainActivity extends Activity {
         page.addView(storageCard, marginTop(matchWrap(), 10));
 
         LinearLayout about = cardTint(Color.rgb(255, 244, 246));
-        about.addView(text("Howie Translate 0.8.0 Saved + OCR preview", 17, RED, true));
-        about.addView(text("Google Online now detects every installed Android speech service, prefers Google, checks language support where available, and automatically changes service if one appears to listen but returns no microphone activity. Start and Stop retain the explicit state machine and watchdog. Offline Whisper remains available when original audio retention is required.", 14, TEXT, false), marginTop(matchWrap(), 6));
+        about.addView(text("Howie Translate 0.9.0 Multilingual stability build", 17, RED, true));
+        about.addView(text("Adds Thai, Malay, Cantonese and Teo Chew selections; sequential translation-model downloads; model and translation timeouts; Chinese-script OCR; and editable OCR review. Cantonese and Teo Chew are best-effort dialect modes that use Chinese writing models.", 14, TEXT, false), marginTop(matchWrap(), 6));
         page.addView(about, marginTop(matchWrap(), 10));
 
         download.setOnClickListener(v -> {
@@ -953,7 +966,7 @@ public class MainActivity extends Activity {
             translationManager.prepareAll(new TranslationManager.PreparationCallback() {
                 @Override public void onProgress(String message) { runOnUiThread(() -> modelStatus.setText(message)); }
                 @Override public void onComplete() { runOnUiThread(() -> {
-                    modelStatus.setText("All offline translation models are ready ✓");
+                    modelStatus.setText("English, Chinese, Vietnamese, Thai and Malay models are ready ✓");
                     download.setEnabled(true);
                     toast("Offline translation models are ready.");
                 }); }
@@ -988,8 +1001,11 @@ public class MainActivity extends Activity {
         block.setBackground(rounded(Color.rgb(247, 250, 255), BORDER, 14));
 
         TextView title = text(info.displayName + " speech", 16, TEXT, true);
-        TextView status = text("Included in the multilingual Whisper model ✓", 13,
-                Color.rgb(25, 125, 75), false);
+        String statusText = LanguageSupport.isDialect(language)
+                ? "Best effort: uses the multilingual Whisper Chinese speech model"
+                : "Included in the multilingual Whisper model ✓";
+        TextView status = text(statusText, 13,
+                LanguageSupport.isDialect(language) ? DARK_BLUE : Color.rgb(25, 125, 75), false);
         block.addView(title);
         block.addView(status, marginTop(matchWrap(), 3));
         return block;
@@ -1027,11 +1043,11 @@ public class MainActivity extends Activity {
 
     private void downloadSpeechModelsSequentially(String[] languages, int index, TextView status, Button button) {
         if (index >= languages.length) {
-            status.setText("All three offline speech models are ready ✓");
+            status.setText("The bundled multilingual Whisper model is ready ✓");
             status.setTextColor(Color.rgb(25, 125, 75));
             button.setEnabled(true);
             button.setText("All speech models installed ✓");
-            toast("Offline English, Chinese and Vietnamese speech models are ready.");
+            toast("The multilingual Whisper speech model is ready.");
             return;
         }
         String language = languages[index];
@@ -1071,7 +1087,10 @@ public class MainActivity extends Activity {
                 result.setText(translatedText);
                 updatePinyin(pinyin, source, input, target, translatedText);
                 autoSaveTypedHistory(source, target, input, translatedText);
-                status.setText("Translated and saved to History.");
+                String dialectNotice = LanguageSupport.dialectNotice(source, target);
+                status.setText(dialectNotice.isEmpty()
+                        ? "Translated and saved to History."
+                        : "Translated and saved to History.\n" + dialectNotice);
             }); }
             @Override public void onError(String message) { runOnUiThread(() -> {
                 if (progress != null) progress.setVisibility(View.GONE);
@@ -1082,7 +1101,8 @@ public class MainActivity extends Activity {
     }
 
     private void updatePinyin(TextView view, String source, String sourceText, String target, String targetText) {
-        String chinese = "zh".equals(target) ? targetText : ("zh".equals(source) ? sourceText : "");
+        String chinese = LanguageSupport.isChineseScript(target) ? targetText
+                : (LanguageSupport.isChineseScript(source) ? sourceText : "");
         view.setText(PinyinUtil.toPinyin(chinese));
         view.setVisibility(chinese.isEmpty() ? View.GONE : View.VISIBLE);
     }
@@ -1322,7 +1342,7 @@ public class MainActivity extends Activity {
                 }
                 int previewLineNumber = liveLineNumber + 1;
                 conversationLiveOriginal.setText(previewLineNumber + ". " + livePartialText);
-                conversationLivePinyin.setText("zh".equals(language)
+                conversationLivePinyin.setText(LanguageSupport.isChineseScript(language)
                         ? previewLineNumber + ". " + PinyinUtil.toPinyin(livePartialText) : "");
             }
 
@@ -1334,7 +1354,7 @@ public class MainActivity extends Activity {
                 int lineNumber = ++liveLineNumber;
                 appendTranscriptLine(conversationTranscript, lineNumber, startMs, languageName(language), cleanText);
                 conversationLiveOriginal.setText(lineNumber + ". " + cleanText);
-                conversationLivePinyin.setText("zh".equals(language)
+                conversationLivePinyin.setText(LanguageSupport.isChineseScript(language)
                         ? lineNumber + ". " + PinyinUtil.toPinyin(cleanText) : "");
                 livePartialText = "";
                 lastPreviewSource = "";
@@ -1411,7 +1431,8 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     appendTranscriptLine(conversationTranslation, segment.lineNumber, segment.startMs, languageName(segment.target), translatedText);
                     conversationLiveTranslation.setText(segment.lineNumber + ". " + translatedText);
-                    String chinese = "zh".equals(segment.target) ? translatedText : ("zh".equals(segment.source) ? segment.text : "");
+                    String chinese = LanguageSupport.isChineseScript(segment.target) ? translatedText
+                            : (LanguageSupport.isChineseScript(segment.source) ? segment.text : "");
                     if (!chinese.isEmpty()) appendPinyinLine(segment.lineNumber, segment.startMs, PinyinUtil.toPinyin(chinese));
                     persistLiveHistory(false);
                     if (conversationAutoSpeak != null && conversationAutoSpeak.isChecked()) {
@@ -1708,7 +1729,8 @@ public class MainActivity extends Activity {
         item.targetLanguage = target;
         item.transcript = "1. [00:00] " + languageName(source) + ": " + original.trim();
         item.translation = "1. [00:00] " + languageName(target) + ": " + translated.trim();
-        String chinese = "zh".equals(target) ? translated : ("zh".equals(source) ? original : "");
+        String chinese = LanguageSupport.isChineseScript(target) ? translated
+                : (LanguageSupport.isChineseScript(source) ? original : "");
         item.pinyin = chinese.isEmpty() ? "" : "1. [00:00] " + PinyinUtil.toPinyin(chinese);
         item.notes = HISTORY_ONLY_MARKER;
         db.insertRecording(item);
@@ -2018,8 +2040,8 @@ public class MainActivity extends Activity {
                     item.targetLanguage = codeOf(target);
                     item.transcript = ensureTranscriptNumbering(transcript.getText().toString());
                     item.translation = ensureTranscriptNumbering(translation.getText().toString());
-                    item.pinyin = "zh".equals(item.targetLanguage) ? PinyinUtil.toPinyin(item.translation)
-                            : ("zh".equals(item.sourceLanguage) ? PinyinUtil.toPinyin(item.transcript) : "");
+                    item.pinyin = LanguageSupport.isChineseScript(item.targetLanguage) ? PinyinUtil.toPinyin(item.translation)
+                            : (LanguageSupport.isChineseScript(item.sourceLanguage) ? PinyinUtil.toPinyin(item.transcript) : "");
                     item.notes = notes.getText().toString().trim();
                     db.updateRecording(item);
                     afterSave.run();
@@ -2074,8 +2096,8 @@ public class MainActivity extends Activity {
                     item.category = clean(category.getText().toString(), "General");
                     item.notes = notes.getText().toString().trim();
                     item.favorite = favorite.isChecked();
-                    String chinese = "zh".equals(item.targetLanguage) ? item.translatedText
-                            : ("zh".equals(item.sourceLanguage) ? item.originalText : "");
+                    String chinese = LanguageSupport.isChineseScript(item.targetLanguage) ? item.translatedText
+                            : (LanguageSupport.isChineseScript(item.sourceLanguage) ? item.originalText : "");
                     item.pinyin = PinyinUtil.toPinyin(chinese);
                     if (item.originalText.isEmpty() && item.translatedText.isEmpty()) {
                         toast("The glossary entry was empty and was not saved.");
@@ -2442,20 +2464,17 @@ public class MainActivity extends Activity {
     }
 
     private int indexOfCode(String code) {
-        for (int i = 0; i < LANGUAGE_CODES.length; i++) if (LANGUAGE_CODES[i].equals(code)) return i;
+        String normalised = LanguageSupport.normalise(code);
+        for (int i = 0; i < LANGUAGE_CODES.length; i++) if (LANGUAGE_CODES[i].equals(normalised)) return i;
         return 0;
     }
 
     private String languageName(String code) {
-        return LANGUAGE_NAMES[indexOfCode(code)];
+        return LanguageSupport.displayName(code);
     }
 
     private String localeTag(String code) {
-        switch (code) {
-            case "zh": return "zh-CN";
-            case "vi": return "vi-VN";
-            default: return "en-AU";
-        }
+        return LanguageSupport.localeTag(code);
     }
 
     private int dp(int value) {
@@ -2541,21 +2560,80 @@ public class MainActivity extends Activity {
     }
 
     private void processOcrImage(InputImage image) {
-        toast("Reading the full-resolution image…");
-        textRecognizer.process(image)
+        String sourceCode = LanguageSupport.normalise(activeOcrSourceCode);
+        TextRecognizer recognizer = LanguageSupport.isChineseScript(sourceCode)
+                ? chineseTextRecognizer : latinTextRecognizer;
+        toast("Reading the full-resolution image as " + languageName(sourceCode) + "...");
+        recognizer.process(image)
                 .addOnSuccessListener(result -> {
-                    String extracted = result.getText() == null ? "" : result.getText().trim();
+                    String extracted = extractOcrText(result, sourceCode);
                     if (extracted.isEmpty()) {
+                        String extra = LanguageSupport.isThai(sourceCode)
+                                ? " Thai-script OCR is not available in the current ML Kit recognizer. You can copy Thai text from Google Lens and paste it into Translate."
+                                : "";
                         new AlertDialog.Builder(this)
                                 .setTitle("No text detected")
-                                .setMessage("Try cropping closer to the text, hold the camera square to the page, and use brighter even lighting.")
+                                .setMessage("Try cropping closer to the text, hold the camera square to the page, and use brighter even lighting." + extra)
                                 .setPositiveButton("OK", null).show();
                         return;
                     }
-                    if (activeOcrInput != null) activeOcrInput.setText(extracted);
-                    toast("Text extracted from the full-resolution image. Review it before translating.");
+                    showOcrReview(extracted, sourceCode);
                 })
-                .addOnFailureListener(error -> toast("OCR failed: " + (error.getMessage() == null ? "Unable to read this image." : error.getMessage())));
+                .addOnFailureListener(error -> toast("OCR failed: "
+                        + (error.getMessage() == null ? "Unable to read this image." : error.getMessage())));
+    }
+
+    private String extractOcrText(Text result, String sourceCode) {
+        if (result == null) return "";
+        if (!LanguageSupport.isChineseScript(sourceCode) && !LanguageSupport.isThai(sourceCode)) {
+            return result.getText() == null ? "" : result.getText().trim();
+        }
+
+        Character.UnicodeScript expected = LanguageSupport.isThai(sourceCode)
+                ? Character.UnicodeScript.THAI : Character.UnicodeScript.HAN;
+        StringBuilder filtered = new StringBuilder();
+        for (Text.TextBlock block : result.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                String value = line.getText() == null ? "" : line.getText().trim();
+                if (!value.isEmpty() && containsScript(value, expected)) {
+                    if (filtered.length() > 0) filtered.append('\n');
+                    filtered.append(value);
+                }
+            }
+        }
+        return filtered.toString().trim();
+    }
+
+    private boolean containsScript(String value, Character.UnicodeScript expected) {
+        if (value == null) return false;
+        for (int offset = 0; offset < value.length();) {
+            int codePoint = value.codePointAt(offset);
+            offset += Character.charCount(codePoint);
+            if (Character.UnicodeScript.of(codePoint) == expected) return true;
+        }
+        return false;
+    }
+
+    private void showOcrReview(String extracted, String sourceCode) {
+        EditText review = input("Review detected text...", 8);
+        review.setText(extracted);
+        review.setSelection(review.getText().length());
+        String message = "Only text matching the selected source language was kept. Edit any OCR mistakes before translating.";
+        if (LanguageSupport.isDialect(sourceCode)) {
+            message += " Cantonese and Teo Chew images use the Chinese-script recognizer.";
+        }
+        LinearLayout body = vertical();
+        body.addView(text(message, 13, MUTED, false));
+        body.addView(review, marginTop(matchWrap(), 10));
+        new AlertDialog.Builder(this)
+                .setTitle("Review detected " + languageName(sourceCode) + " text")
+                .setView(wrapDialog(body))
+                .setNegativeButton("Discard", null)
+                .setPositiveButton("Use text", (dialog, which) -> {
+                    if (activeOcrInput != null) activeOcrInput.setText(review.getText().toString().trim());
+                    toast("Detected text added. Tap Translate when ready.");
+                })
+                .show();
     }
 
     private void showRetranslateDialog(Models.RecordingItem item) {

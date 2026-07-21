@@ -673,21 +673,18 @@ final class GoogleOnlineSpeechManager {
         String text = safe(input).replaceAll("\\s+", " ").trim();
         if (text.isEmpty()) return "";
         if (containsUnexpectedScript(text, language)) return "";
-        if ("zh".equals(language)) text = text.replaceAll("(?<=\\p{IsHan})\\s+(?=\\p{IsHan})", "");
+        if (LanguageSupport.isChineseScript(language)) {
+            text = text.replaceAll("(?<=\\p{IsHan})\\s+(?=\\p{IsHan})", "");
+        }
         return text;
     }
 
     private static boolean containsUnexpectedScript(String text, String language) {
-        boolean chinese = "zh".equals(language);
         for (int offset = 0; offset < text.length();) {
             int cp = text.codePointAt(offset);
             offset += Character.charCount(cp);
             Character.UnicodeScript script = Character.UnicodeScript.of(cp);
-            if (script == Character.UnicodeScript.COMMON
-                    || script == Character.UnicodeScript.INHERITED
-                    || script == Character.UnicodeScript.LATIN) continue;
-            if (chinese && script == Character.UnicodeScript.HAN) continue;
-            return true;
+            if (!LanguageSupport.acceptsScript(language, script)) return true;
         }
         return false;
     }
@@ -717,24 +714,15 @@ final class GoogleOnlineSpeechManager {
     }
 
     private static String normalise(String language) {
-        if ("zh".equals(language) || "vi".equals(language)) return language;
-        return "en";
+        return LanguageSupport.normalise(language);
     }
 
     private static String localeTag(String language) {
-        switch (normalise(language)) {
-            case "zh": return "zh-CN";
-            case "vi": return "vi-VN";
-            default: return "en-AU";
-        }
+        return LanguageSupport.localeTag(language);
     }
 
     private static String displayName(String language) {
-        switch (normalise(language)) {
-            case "zh": return "Mandarin Chinese";
-            case "vi": return "Vietnamese";
-            default: return "English";
-        }
+        return LanguageSupport.displayName(language);
     }
 
     private static String safe(String value) {

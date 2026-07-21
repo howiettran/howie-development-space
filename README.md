@@ -1,34 +1,45 @@
-# Howie Translate 0.5.0 Accuracy & History Beta
+# Howie Translate 0.9.0 Multilingual Stability Build
 
-This build separates automatic History records from the Audio Library and tunes the bundled on-device Whisper pipeline for natural-paced speech.
+Howie Translate is an Android translation, live-conversation, OCR, history and saved-recording app.
 
-## History and Audio behaviour
+## Languages
 
-- Every successful typed translation is saved to **History** automatically.
-- Every completed live conversation is saved to **History** automatically.
-- The **Audio** page only shows conversations that the user explicitly adds by tapping **Save to Audio Library**.
-- History retains Open, Edit, Delete and drag-to-reorder controls.
-- A History-only live conversation retains its original recording for review but stays hidden from Audio until deliberately saved.
+- English
+- Mandarin Chinese
+- Vietnamese
+- Thai
+- Malay
+- Cantonese (best effort)
+- Teo Chew (best effort)
 
-## Accuracy tuning
+ML Kit provides dedicated on-device translation models for English, Chinese, Vietnamese, Thai and Malay. Cantonese and Teo Chew use the Chinese writing model because ML Kit does not provide separate translation models for those dialects.
 
-- Recognition stays locked to the selected source language.
-- The end-of-speech detector waits about 800 ms before closing a phrase.
-- A phrase can retain up to about 8 seconds of context.
-- A 500 ms pre-roll reduces clipped beginnings.
-- Very short fragments are rejected more aggressively.
-- Whisper's segment allowance is increased for more natural sentence lengths.
+## Stability changes
 
-The packaged APK continues to use the bundled multilingual Tiny model. The changes in this release improve segmentation and context handling; they do not replace the model with Base or Small.
+- Translation-model checks and translations have timeouts so the interface cannot remain on Preparing forever.
+- Settings downloads translation models sequentially, one language at a time.
+- Live Conversation returns to an actionable error state when a language model cannot be prepared.
+- The Settings status identifies the language currently being checked or downloaded.
+
+## Image translation
+
+- Camera and uploaded images are processed at full resolution.
+- Mandarin Chinese, Cantonese and Teo Chew use the bundled Chinese-script OCR model.
+- Latin-script languages use the bundled Latin OCR model.
+- Unrelated lines that do not match the selected script are filtered out.
+- OCR text is editable in a review window before it is placed into Translate.
+- Thai typed, pasted and speech translation is supported. Thai-script OCR is not included in the current ML Kit OCR libraries used by this build.
 
 ## Existing features
 
-- Offline English, Mandarin Chinese and Vietnamese transcription and translation
-- Numbered bilingual transcripts and Chinese pinyin
-- MP3 and karaoke MP4 export for Audio Library recordings
-- Searchable and editable History
-- Glossary organisation and editable categories
+- Google Online speech with Offline Whisper fallback
+- Numbered bilingual transcripts and Mandarin pinyin
+- Automatic History plus deliberate Saved conversations and recordings
+- Separate MP3 and MP4 export folders
+- MP3 and karaoke MP4 export
+- Searchable History and glossary
+- Re-translate a History conversation into another supported language
 
 ## Building
 
-The project is an Android Gradle project. The bundled model and local AAR dependencies make the source archive large. A Java 17-compatible Android build environment and Android SDK 35 are recommended.
+The project is an Android Gradle project. It uses Java 17, Android SDK 35 and Gradle 8.10.2. The included GitHub Actions workflow builds a debug APK and uploads it as an artifact.

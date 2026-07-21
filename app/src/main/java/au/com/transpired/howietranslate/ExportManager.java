@@ -385,7 +385,7 @@ final class ExportManager {
     private List<String> tokenize(String text, String language) {
         List<String> result = new ArrayList<>();
         if (text == null || text.trim().isEmpty()) return result;
-        if ("zh".equals(language) || containsHan(text)) {
+        if (LanguageSupport.isChineseScript(language) || containsHan(text)) {
             text.codePoints().forEach(cp -> {
                 String token = new String(Character.toChars(cp));
                 if (!token.trim().isEmpty()) result.add(token);
@@ -502,9 +502,7 @@ final class ExportManager {
     }
 
     private String languageName(String code) {
-        if ("zh".equals(code)) return "中文";
-        if ("vi".equals(code)) return "Tiếng Việt";
-        return "English";
+        return LanguageSupport.displayName(code);
     }
 
     private String friendly(Exception e) {
