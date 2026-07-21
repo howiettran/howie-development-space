@@ -59,6 +59,8 @@ import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.text.SimpleDateFormat;
@@ -81,6 +83,7 @@ public class MainActivity extends Activity {
     private static final int REQUEST_MP4_FOLDER = 915;
     private static final String SAVED_CONVERSATION_MARKER = "[SAVED_CONVERSATION]";
     private static final String SAVED_COPY_MARKER = "[SAVED_COPY]";
+    private static final String SAVED_SOURCE_PREFIX = "[SAVED_SOURCE:";
     private Uri pendingOcrCameraUri;
 
     private static final String[] LANGUAGE_NAMES = LanguageSupport.NAMES;
@@ -123,6 +126,8 @@ public class MainActivity extends Activity {
     private boolean usingOnDeviceRecognizer;
 
     private MediaRecorder recorder;
+    private boolean onlineRecorderActive;
+    private boolean currentConversationSaved;
     private File currentRecordingFile;
     private long currentHistoryId;
     private long recordingStartedAt;
@@ -213,9 +218,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (recorder != null) {
-            try { recorder.release(); } catch (Exception ignored) {}
-        }
+        stopOnlineSidecarRecording(true);
         destroySpeechRecognizer();
         if (googleOnlineSpeechManager != null) googleOnlineSpeechManager.close();
         if (streamingSpeechManager != null) streamingSpeechManager.close();
@@ -491,11 +494,16 @@ public class MainActivity extends Activity {
         TextView engineLabel = text("Speech engine", 14, TEXT, true);
         engineLabel.setGravity(Gravity.CENTER_VERTICAL);
         conversationEngine = new Spinner(this);
-        String[] engineOptions = {"Google Online – auto-select service", "Offline Whisper"};
+        String[] engineOptions = {
+                "Google Online – best recognition; audio depends on phone",
+                "Offline Whisper – recommended when audio must be saved"
+        };
         ArrayAdapter<String> engineAdapter = new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_dropdown_item, engineOptions);
         conversationEngine.setAdapter(engineAdapter);
-        conversationEngine.setSelection(0);
+        // Use Offline Whisper by default because it records a guaranteed local audio file.
+        // Google Online remains available for users who prefer its recognition quality.
+        conversationEngine.setSelection(1);
         engineRow.addView(engineLabel, new LinearLayout.LayoutParams(0, dp(52), 0.8f));
         LinearLayout.LayoutParams engineLp = new LinearLayout.LayoutParams(0, dp(52), 1.7f);
         engineLp.setMargins(dp(8), 0, 0, 0);
@@ -559,8 +567,8 @@ public class MainActivity extends Activity {
         page.addView(conversationTranslation, marginTop(matchWrap(), 5));
         page.addView(conversationPinyin, marginTop(matchWrap(), 5));
 
-        saveRecordingButton = button("Save to Saved", true);
-        saveRecordingButton.setEnabled(currentRecordingFile != null && !isRecording);
+        saveRecordingButton = button(currentConversationSaved ? "Saved ✓" : "Save to Saved", true);
+        saveRecordingButton.setEnabled(!currentConversationSaved && !isRecording && hasCurrentConversationContent());
         Button newConversation = button("New conversation", false);
         Button addGlossary = button("Add selected transcript text to Glossary", false);
         LinearLayout saveRow = horizontal();
@@ -644,8 +652,11 @@ public class MainActivity extends Activity {
             }
             LinearLayout card = card();
             TextView title = text(item.title, 18, TEXT, true);
+            boolean savedHasAudio = item.path != null && !item.path.trim().isEmpty()
+                    && new File(item.path).isFile() && new File(item.path).length() > 1024L;
             TextView meta = text(languageName(item.sourceLanguage) + " → " + languageName(item.targetLanguage)
-                    + "  •  " + formatDuration(item.durationMs) + "  •  " + formatDate(item.createdAt), 12, MUTED, false);
+                    + "  •  " + formatDuration(item.durationMs) + "  •  " + formatDate(item.createdAt)
+                    + "  •  " + (savedHasAudio ? "Audio available" : "Transcript only"), 12, MUTED, false);
             TextView preview = text(ellipsize(item.transcript.isEmpty() ? "No subtitle added" : ensureTranscriptNumbering(item.transcript), 150), 14, TEXT, false);
             card.addView(title);
             card.addView(meta, marginTop(matchWrap(), 4));
@@ -665,6 +676,8 @@ public class MainActivity extends Activity {
             LinearLayout exports = horizontal();
             Button mp3 = button("⬇ MP3", false);
             Button karaoke = button("🎬 Karaoke MP4", true);
+            mp3.setEnabled(savedHasAudio);
+            karaoke.setEnabled(savedHasAudio);
             exports.addView(mp3, new LinearLayout.LayoutParams(0, dp(46), 1));
             LinearLayout.LayoutParams karaokeLp = new LinearLayout.LayoutParams(0, dp(46), 1.35f);
             karaokeLp.setMargins(dp(7), 0, 0, 0);
@@ -726,8 +739,11 @@ public class MainActivity extends Activity {
             top.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
             top.addView(drag, new LinearLayout.LayoutParams(dp(92), dp(42)));
             recordCard.addView(top);
+            boolean historyHasAudio = item.path != null && !item.path.trim().isEmpty()
+                    && new File(item.path).isFile() && new File(item.path).length() > 1024L;
             recordCard.addView(text(item.category + "  •  " + languageName(item.sourceLanguage) + " → "
-                    + languageName(item.targetLanguage) + "  •  " + formatDuration(item.durationMs), 12, MUTED, false), marginTop(matchWrap(), 4));
+                    + languageName(item.targetLanguage) + "  •  " + formatDuration(item.durationMs)
+                    + "  •  " + (historyHasAudio ? "Audio available" : "Transcript only"), 12, MUTED, false), marginTop(matchWrap(), 4));
             recordCard.addView(text(formatDate(item.createdAt), 12, MUTED, false), marginTop(matchWrap(), 2));
             String previewText = item.transcript == null || item.transcript.trim().isEmpty()
                     ? "No original transcript" : ensureTranscriptNumbering(item.transcript);
@@ -736,7 +752,9 @@ public class MainActivity extends Activity {
             LinearLayout actions = horizontal();
             Button open = button("Open", true);
             Button retranslate = button("Translate", false);
-            Button saveItem = button("Save", false);
+            boolean alreadySaved = db.hasSavedCopyForSource(item.id);
+            Button saveItem = button(alreadySaved ? "Saved ✓" : "Save", false);
+            saveItem.setEnabled(!alreadySaved);
             actions.addView(open, new LinearLayout.LayoutParams(0, dp(45), 1));
             LinearLayout.LayoutParams translateLp = new LinearLayout.LayoutParams(0, dp(45), 1);
             translateLp.setMargins(dp(6), 0, dp(6), 0);
@@ -956,7 +974,7 @@ public class MainActivity extends Activity {
         page.addView(storageCard, marginTop(matchWrap(), 10));
 
         LinearLayout about = cardTint(Color.rgb(255, 244, 246));
-        about.addView(text("Howie Translate 0.9.0 Multilingual stability build", 17, RED, true));
+        about.addView(text("Howie Translate 0.9.1 Saved audio reliability build", 17, RED, true));
         about.addView(text("Adds Thai, Malay, Cantonese and Teo Chew selections; sequential translation-model downloads; model and translation timeouts; Chinese-script OCR; and editable OCR review. Cantonese and Teo Chew are best-effort dialect modes that use Chinese writing models.", 14, TEXT, false), marginTop(matchWrap(), 6));
         page.addView(about, marginTop(matchWrap(), 10));
 
@@ -1105,6 +1123,63 @@ public class MainActivity extends Activity {
                 : (LanguageSupport.isChineseScript(source) ? sourceText : "");
         view.setText(PinyinUtil.toPinyin(chinese));
         view.setVisibility(chinese.isEmpty() ? View.GONE : View.VISIBLE);
+    }
+
+    private boolean startOnlineSidecarRecording(File outputFile) {
+        stopOnlineSidecarRecording(false);
+        if (outputFile == null) return false;
+        try {
+            recorder = Build.VERSION.SDK_INT >= 31 ? new MediaRecorder(this) : new MediaRecorder();
+            recorder.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION);
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            recorder.setAudioSamplingRate(44100);
+            recorder.setAudioEncodingBitRate(128000);
+            recorder.setOutputFile(outputFile.getAbsolutePath());
+            recorder.prepare();
+            recorder.start();
+            onlineRecorderActive = true;
+            return true;
+        } catch (Exception firstFailure) {
+            if (recorder != null) {
+                try { recorder.release(); } catch (Exception ignored) { }
+            }
+            recorder = null;
+            onlineRecorderActive = false;
+            if (outputFile.exists()) outputFile.delete();
+            return false;
+        }
+    }
+
+    private File stopOnlineSidecarRecording(boolean keepValidFile) {
+        MediaRecorder active = recorder;
+        boolean wasActive = onlineRecorderActive;
+        recorder = null;
+        onlineRecorderActive = false;
+        if (active != null) {
+            if (wasActive) {
+                try { active.stop(); } catch (RuntimeException ignored) { }
+            }
+            try { active.reset(); } catch (Exception ignored) { }
+            try { active.release(); } catch (Exception ignored) { }
+        }
+        File file = currentRecordingFile;
+        boolean valid = file != null && file.isFile() && file.length() > 1024L;
+        if (!keepValidFile || !valid) {
+            if (file != null && file.isFile() && active != null) file.delete();
+            return null;
+        }
+        return file;
+    }
+
+    private boolean hasCurrentConversationContent() {
+        boolean hasAudio = currentRecordingFile != null && currentRecordingFile.isFile()
+                && currentRecordingFile.length() > 0L;
+        boolean hasTranscript = conversationTranscript != null
+                && !conversationTranscript.getText().toString().trim().isEmpty();
+        boolean hasTranslation = conversationTranslation != null
+                && !conversationTranslation.getText().toString().trim().isEmpty();
+        return hasAudio || hasTranscript || hasTranslation;
     }
 
     private void requestStartRecording() {
@@ -1272,18 +1347,23 @@ public class MainActivity extends Activity {
         if (token != liveSessionToken || liveControlState != LiveControlState.PREPARING) return;
         if (currentRecordingFile != null && currentRecordingFile.exists() && currentHistoryId == 0) currentRecordingFile.delete();
         currentHistoryId = 0;
-        if (activeGoogleOnlineEngine) {
-            // Google Online must own the microphone directly for reliable recognition. The live
-            // transcript is saved to History, but a reusable source-audio file is not guaranteed.
+        File dir = new File(getFilesDir(), "recordings");
+        if (!dir.exists() && !dir.mkdirs()) {
+            resetLiveControlsToIdle("The recording folder could not be created.");
+            toast("The recording folder could not be created.");
+            return;
+        }
+        currentRecordingFile = new File(dir, "conversation_" + System.currentTimeMillis()
+                + (activeGoogleOnlineEngine ? ".m4a" : ".wav"));
+        currentConversationSaved = false;
+        if (activeGoogleOnlineEngine && !startOnlineSidecarRecording(currentRecordingFile)) {
+            // Some phones do not allow the app and the online recogniser to capture the
+            // microphone at the same time. Continue with the transcript, but make the limitation
+            // visible instead of creating a database link to an empty or corrupt file.
             currentRecordingFile = null;
-        } else {
-            File dir = new File(getFilesDir(), "recordings");
-            if (!dir.exists() && !dir.mkdirs()) {
-                resetLiveControlsToIdle("The recording folder could not be created.");
-                toast("The recording folder could not be created.");
-                return;
+            if (conversationStatus != null) {
+                conversationStatus.setText("Google Online is ready, but this phone would not allow a separate audio recording. Choose Offline Whisper when the audio file must be retained.");
             }
-            currentRecordingFile = new File(dir, "conversation_" + System.currentTimeMillis() + ".wav");
         }
         pendingDurationMs = 0;
         recordingStartedAt = System.currentTimeMillis();
@@ -1373,7 +1453,9 @@ public class MainActivity extends Activity {
 
             @Override public void onStopped(File audioFile, long durationMs) {
                 if (token != liveSessionToken) return;
-                finishLiveRecordingUi(durationMs, audioFile);
+                File completedAudio = activeGoogleOnlineEngine
+                        ? stopOnlineSidecarRecording(true) : audioFile;
+                finishLiveRecordingUi(durationMs, completedAudio);
             }
         };
 
@@ -1458,12 +1540,21 @@ public class MainActivity extends Activity {
     private void maybeEnableLiveSave() {
         if (!liveAudioStopped || liveTranslationBusy || !liveTranslationQueue.isEmpty()) return;
         autoSaveLiveHistory();
-        boolean ready = currentRecordingFile != null && currentRecordingFile.exists();
-        if (saveRecordingButton != null) saveRecordingButton.setEnabled(ready);
+        boolean hasAudio = currentRecordingFile != null && currentRecordingFile.isFile()
+                && currentRecordingFile.length() > 1024L;
+        boolean ready = hasCurrentConversationContent() && !currentConversationSaved;
+        if (saveRecordingButton != null) {
+            saveRecordingButton.setEnabled(ready);
+            saveRecordingButton.setText(currentConversationSaved ? "Saved ✓" : "Save to Saved");
+        }
         if (conversationStatus != null) {
-            conversationStatus.setText(ready
-                    ? "Saved automatically to History. Tap Save to Saved to keep it in Audio."
-                    : "Saved automatically to History. This speech service did not provide a reusable audio recording on this device.");
+            if (currentConversationSaved) {
+                conversationStatus.setText("Saved. History keeps its own conversation and audio link.");
+            } else if (hasAudio) {
+                conversationStatus.setText("Saved automatically to History. Tap Save to Saved to create a separate protected copy with audio.");
+            } else {
+                conversationStatus.setText("Saved automatically to History. You can save the transcript now, or use Offline Whisper next time to guarantee a reusable audio file.");
+            }
         }
     }
 
@@ -1534,7 +1625,9 @@ public class MainActivity extends Activity {
             if (activeGoogleOnlineEngine) googleOnlineSpeechManager.forceStop();
             else streamingSpeechManager.stop();
             long elapsed = recordingStartedAt == 0 ? 0 : Math.max(0, System.currentTimeMillis() - recordingStartedAt);
-            finishLiveRecordingUi(elapsed, currentRecordingFile);
+            File completedAudio = activeGoogleOnlineEngine
+                    ? stopOnlineSidecarRecording(true) : currentRecordingFile;
+            finishLiveRecordingUi(elapsed, completedAudio);
             if (conversationStatus != null) {
                 conversationStatus.setText(activeGoogleOnlineEngine
                         ? "Google Online stopped. The transcript captured so far was retained in History."
@@ -1550,7 +1643,12 @@ public class MainActivity extends Activity {
             liveStopWatchdog = null;
         }
         pendingDurationMs = Math.max(0, durationMs);
-        if (audioFile != null && audioFile.exists()) currentRecordingFile = audioFile;
+        if (activeGoogleOnlineEngine) {
+            currentRecordingFile = audioFile != null && audioFile.isFile() && audioFile.length() > 1024L
+                    ? audioFile : null;
+        } else if (audioFile != null && audioFile.isFile()) {
+            currentRecordingFile = audioFile;
+        }
         isRecording = false;
         liveConversationActive = false;
         liveAudioStopped = true;
@@ -1633,31 +1731,115 @@ public class MainActivity extends Activity {
     }
 
     private void savePendingRecording() {
-        if (currentRecordingFile == null || !currentRecordingFile.exists()) {
-            toast("Record some audio first.");
+        if (!hasCurrentConversationContent()) {
+            toast("There is no conversation to save yet.");
             return;
         }
-        Models.RecordingItem item = findCurrentHistoryItem();
-        if (item == null) item = new Models.RecordingItem();
-        item.title = clean(conversationTitle.getText().toString(), "Conversation " + formatDate(System.currentTimeMillis()));
-        item.category = clean(conversationCategory.getText().toString(), "General");
-        item.path = currentRecordingFile != null && currentRecordingFile.exists()
-                ? currentRecordingFile.getAbsolutePath() : "";
-        item.sourceLanguage = liveLanguageA;
-        item.targetLanguage = liveLanguageB;
-        item.transcript = conversationTranscript.getText().toString().trim();
-        item.translation = conversationTranslation.getText().toString().trim();
-        item.pinyin = conversationPinyin.getText().toString().trim();
-        item.durationMs = pendingDurationMs;
-        item.notes = item.notes == null ? "" : item.notes.replace(HISTORY_ONLY_MARKER, "");
-        if (item.id == 0) item.id = db.insertRecording(item); else db.updateRecording(item);
-        currentRecordingFile = null;
-        currentHistoryId = 0;
-        pendingDurationMs = 0;
-        recordingTimer.setText("Saved  " + formatDuration(item.durationMs));
-        conversationStatus.setText("Saved. The History record remains linked to this conversation.");
+        persistLiveHistory(currentHistoryId == 0);
+        Models.RecordingItem historyItem = findCurrentHistoryItem();
+        if (historyItem == null) {
+            toast("The History conversation could not be found. Please stop the conversation and try again.");
+            return;
+        }
+        Models.RecordingItem saved = createSavedCopy(historyItem, true);
+        if (saved == null) return;
+        currentConversationSaved = true;
+        recordingTimer.setText("Saved  " + formatDuration(historyItem.durationMs));
+        conversationStatus.setText(saved.path == null || saved.path.isEmpty()
+                ? "Conversation saved. No reusable audio file was available, so the transcript was saved without audio."
+                : "Conversation and audio saved. History keeps its original audio link.");
+        saveRecordingButton.setText("Saved ✓");
         saveRecordingButton.setEnabled(false);
-        toast("Conversation saved.");
+        persistentPages.remove("saved");
+        persistentPages.remove("history");
+        toast(saved.path == null || saved.path.isEmpty()
+                ? "Conversation saved without audio."
+                : "Conversation and audio saved.");
+    }
+
+    private Models.RecordingItem createSavedCopy(Models.RecordingItem source, boolean showErrors) {
+        if (source == null) return null;
+        if (db.hasSavedCopyForSource(source.id)) {
+            if (showErrors) toast("This conversation is already in Saved.");
+            return db.getSavedCopyForSource(source.id);
+        }
+        Models.RecordingItem saved = new Models.RecordingItem();
+        saved.title = source.title;
+        saved.category = source.category;
+        saved.sourceLanguage = source.sourceLanguage;
+        saved.targetLanguage = source.targetLanguage;
+        saved.transcript = source.transcript;
+        saved.translation = source.translation;
+        saved.pinyin = source.pinyin;
+        saved.durationMs = source.durationMs;
+        saved.createdAt = System.currentTimeMillis();
+        saved.sortOrder = 0;
+        saved.notes = cleanSavedNotes(source.notes, source.id);
+
+        File sourceAudio = source.path == null || source.path.trim().isEmpty()
+                ? null : new File(source.path);
+        if (sourceAudio != null && sourceAudio.isFile() && sourceAudio.length() > 1024L) {
+            try {
+                saved.path = copyAudioToSavedStorage(sourceAudio, source.id);
+            } catch (IOException e) {
+                if (showErrors) {
+                    new AlertDialog.Builder(this)
+                            .setTitle("Audio could not be saved")
+                            .setMessage("The conversation is still safe in History, but its audio could not be copied to Saved. "
+                                    + (e.getMessage() == null ? "Please try again." : e.getMessage()))
+                            .setPositiveButton("OK", null)
+                            .show();
+                }
+                return null;
+            }
+        } else {
+            saved.path = "";
+        }
+        saved.id = db.insertRecording(saved);
+        if (saved.id <= 0) {
+            if (saved.path != null && !saved.path.isEmpty()) {
+                File copied = new File(saved.path);
+                if (copied.isFile()) copied.delete();
+            }
+            if (showErrors) toast("The conversation could not be added to Saved.");
+            return null;
+        }
+        return saved;
+    }
+
+    private String cleanSavedNotes(String notes, long sourceId) {
+        String clean = notes == null ? "" : notes
+                .replace(HISTORY_ONLY_MARKER, "")
+                .replace(SAVED_COPY_MARKER, "")
+                .replace(SAVED_CONVERSATION_MARKER, "")
+                .replaceAll("\\[SAVED_SOURCE:[0-9]+\\]", "")
+                .trim();
+        return (clean + " " + SAVED_CONVERSATION_MARKER + " " + SAVED_COPY_MARKER
+                + " " + SAVED_SOURCE_PREFIX + sourceId + "]").trim();
+    }
+
+    private String copyAudioToSavedStorage(File source, long sourceId) throws IOException {
+        File dir = new File(getFilesDir(), "saved_recordings");
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IOException("The Saved audio folder could not be created.");
+        }
+        String name = source.getName();
+        String extension = "";
+        int dot = name.lastIndexOf('.');
+        if (dot >= 0) extension = name.substring(dot);
+        File destination = new File(dir, "saved_" + sourceId + "_" + System.currentTimeMillis() + extension);
+        try (FileInputStream input = new FileInputStream(source);
+             FileOutputStream output = new FileOutputStream(destination)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+            output.flush();
+        }
+        if (!destination.isFile() || destination.length() != source.length()) {
+            destination.delete();
+            throw new IOException("The copied audio file was incomplete.");
+        }
+        return destination.getAbsolutePath();
     }
 
     private void confirmNewConversation() {
@@ -1684,8 +1866,10 @@ public class MainActivity extends Activity {
 
     private void resetConversationPage() {
         if (currentRecordingFile != null && currentRecordingFile.exists() && currentHistoryId == 0) currentRecordingFile.delete();
+        stopOnlineSidecarRecording(false);
         currentRecordingFile = null;
         currentHistoryId = 0;
+        currentConversationSaved = false;
         pendingDurationMs = 0;
         liveLineNumber = 0;
         livePartialText = "";
@@ -1701,7 +1885,10 @@ public class MainActivity extends Activity {
         if (conversationMicLevel != null) conversationMicLevel.setProgress(0);
         if (recordingTimer != null) recordingTimer.setText("Ready for a live conversation");
         if (conversationStatus != null) conversationStatus.setText("Choose a language pair, then tap Start live.");
-        if (saveRecordingButton != null) saveRecordingButton.setEnabled(false);
+        if (saveRecordingButton != null) {
+            saveRecordingButton.setText("Save to Saved");
+            saveRecordingButton.setEnabled(false);
+        }
     }
 
     private String selectedOrAll(EditText field) {
@@ -1749,7 +1936,7 @@ public class MainActivity extends Activity {
         }
         item.title = clean(conversationTitle.getText().toString(), "Conversation " + formatDate(System.currentTimeMillis()));
         item.category = clean(conversationCategory.getText().toString(), "General");
-        item.path = currentRecordingFile != null && currentRecordingFile.exists()
+        item.path = currentRecordingFile != null
                 ? currentRecordingFile.getAbsolutePath() : "";
         item.sourceLanguage = liveLanguageA;
         item.targetLanguage = liveLanguageB;
@@ -1807,8 +1994,19 @@ public class MainActivity extends Activity {
 
     private void showAudioPlayer(Models.RecordingItem item) {
         File file = item.path == null || item.path.trim().isEmpty() ? null : new File(item.path);
-        if (file == null || !file.isFile()) {
-            showTextHistory(item);
+        if (file == null || !file.isFile() || file.length() <= 1024L) {
+            String message;
+            if (item.path == null || item.path.trim().isEmpty()) {
+                message = "No reusable audio file was created for this conversation. This commonly happens when Google Online owns the microphone on the phone. Use Offline Whisper for conversations where the recording must always be retained.";
+            } else {
+                message = "The linked audio file is missing or incomplete. The transcript is still available, but this recording cannot be played.";
+            }
+            new AlertDialog.Builder(this)
+                    .setTitle("Audio unavailable")
+                    .setMessage(message)
+                    .setNegativeButton("Close", null)
+                    .setPositiveButton("View transcript", (dialog, which) -> showTextHistory(item))
+                    .show();
             return;
         }
         LinearLayout body = vertical();
@@ -2050,15 +2248,19 @@ public class MainActivity extends Activity {
 
     private void confirmDeleteRecording(Models.RecordingItem item, Runnable afterDelete) {
         new AlertDialog.Builder(this)
-                .setTitle("Delete recording?")
-                .setMessage("This permanently deletes this History or Audio record and any linked audio file from this phone.")
+                .setTitle("Delete this item?")
+                .setMessage("This removes this History or Saved item. A shared audio file is only deleted when no other record still uses it.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Delete", (d, w) -> {
-                    if (item.path != null && !item.path.trim().isEmpty()) {
-                        File f = new File(item.path);
+                    String path = item.path == null ? "" : item.path.trim();
+                    boolean shared = db.hasOtherRecordingUsingPath(path, item.id);
+                    db.deleteRecording(item.id);
+                    if (!shared && !path.isEmpty()) {
+                        File f = new File(path);
                         if (f.isFile()) f.delete();
                     }
-                    db.deleteRecording(item.id);
+                    persistentPages.remove("history");
+                    persistentPages.remove("saved");
                     afterDelete.run();
                 }).show();
     }
@@ -2668,37 +2870,29 @@ public class MainActivity extends Activity {
     }
 
     private void showSaveHistoryDialog(Models.RecordingItem item, Runnable refresh) {
-        boolean hasAudio = item.path != null && !item.path.trim().isEmpty() && new File(item.path).exists();
-        String[] choices = hasAudio
-                ? new String[]{"Save conversation and recording", "Save conversation only"}
-                : new String[]{"Save conversation"};
+        if (db.hasSavedCopyForSource(item.id)) {
+            toast("This conversation is already in Saved.");
+            return;
+        }
+        boolean hasAudio = item.path != null && !item.path.trim().isEmpty()
+                && new File(item.path).isFile() && new File(item.path).length() > 1024L;
+        String message = hasAudio
+                ? "A separate copy of the conversation and audio will be created. The original History audio will remain untouched."
+                : "This conversation has no reusable audio file. Its transcript and translation will still be saved.";
         new AlertDialog.Builder(this)
-                .setTitle("Save from History")
-                .setItems(choices, (dialog, which) -> {
-                    Models.RecordingItem saved = new Models.RecordingItem();
-                    saved.title = item.title;
-                    saved.category = item.category;
-                    saved.path = (hasAudio && which == 0) ? item.path : "";
-                    saved.sourceLanguage = item.sourceLanguage;
-                    saved.targetLanguage = item.targetLanguage;
-                    saved.transcript = item.transcript;
-                    saved.translation = item.translation;
-                    saved.pinyin = item.pinyin;
-                    saved.notes = ((item.notes == null ? "" : item.notes)
-                            .replace(HISTORY_ONLY_MARKER, "")
-                            .replace(SAVED_COPY_MARKER, "")).trim()
-                            + " " + SAVED_CONVERSATION_MARKER + " " + SAVED_COPY_MARKER;
-                    saved.createdAt = System.currentTimeMillis();
-                    saved.durationMs = item.durationMs;
-                    saved.sortOrder = 0;
-                    db.insertRecording(saved);
-                    toast(hasAudio && which == 0
-                            ? "Saved copy created. The original History conversation still keeps its audio."
-                            : "Conversation saved. The original History item was not changed.");
+                .setTitle("Save conversation")
+                .setMessage(message)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save", (dialog, which) -> {
+                    Models.RecordingItem saved = createSavedCopy(item, true);
+                    if (saved == null) return;
+                    toast(saved.path == null || saved.path.isEmpty()
+                            ? "Conversation saved without audio."
+                            : "Conversation and audio copied to Saved.");
                     persistentPages.remove("saved");
+                    persistentPages.remove("history");
                     refresh.run();
                 })
-                .setNegativeButton("Cancel", null)
                 .show();
     }
 

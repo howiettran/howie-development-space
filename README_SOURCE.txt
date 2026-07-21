@@ -1,4 +1,4 @@
-Howie Translate v0.9.0 Multilingual Stability - Android source
+Howie Translate v0.9.1 Saved Audio Reliability - Android source
 
 Main changes:
 - Adds Thai and Malay translation and speech selections.

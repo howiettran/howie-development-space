@@ -1,4 +1,4 @@
-# Howie Translate 0.9.0 Multilingual Stability Build
+# Howie Translate 0.9.1 Saved Audio Reliability Build
 
 Howie Translate is an Android translation, live-conversation, OCR, history and saved-recording app.
 
@@ -29,6 +29,15 @@ ML Kit provides dedicated on-device translation models for English, Chinese, Vie
 - Unrelated lines that do not match the selected script are filtered out.
 - OCR text is editable in a review window before it is placed into Translate.
 - Thai typed, pasted and speech translation is supported. Thai-script OCR is not included in the current ML Kit OCR libraries used by this build.
+
+
+## Saved audio reliability
+
+- Save to Saved works for audio and transcript-only conversations.
+- Saved receives a separate physical audio copy; History keeps the original.
+- Offline Whisper is the default Conversation engine because it guarantees a local recording.
+- Google Online attempts an additional M4A recording where the phone permits concurrent microphone capture.
+- History and Saved identify whether audio is available.
 
 ## Existing features
 

@@ -125,6 +125,34 @@ final class AppDatabase extends SQLiteOpenHelper {
         getWritableDatabase().delete("recordings", "id=?", new String[]{String.valueOf(id)});
     }
 
+    boolean hasSavedCopyForSource(long sourceId) {
+        return getSavedCopyForSource(sourceId) != null;
+    }
+
+    Models.RecordingItem getSavedCopyForSource(long sourceId) {
+        String marker = "%[SAVED_SOURCE:" + sourceId + "]%";
+        Cursor c = getReadableDatabase().query("recordings", null,
+                "notes LIKE ? AND notes LIKE ?", new String[]{marker, "%" + SAVED_COPY_MARKER + "%"},
+                null, null, "created_at DESC", "1");
+        try {
+            return c.moveToFirst() ? readRecording(c) : null;
+        } finally {
+            c.close();
+        }
+    }
+
+    boolean hasOtherRecordingUsingPath(String path, long excludingId) {
+        if (path == null || path.trim().isEmpty()) return false;
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COUNT(*) FROM recordings WHERE path=? AND id<>?",
+                new String[]{path, String.valueOf(excludingId)});
+        try {
+            return c.moveToFirst() && c.getLong(0) > 0L;
+        } finally {
+            c.close();
+        }
+    }
+
     List<Models.RecordingItem> getRecordings(String query) {
         String q = query == null ? "" : query.trim();
         String selection;
