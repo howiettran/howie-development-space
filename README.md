@@ -1,4 +1,4 @@
-# Howie Translate 0.10.1 Translation Startup Fix Build
+# Howie Translate 0.10.2 Translation Startup Fix Build
 
 This Android source package keeps the v0.10.0 audio, export, glossary and original-image improvements, and fixes the translation-model startup path that left Translate and Start Live stuck in Preparing mode.
 
@@ -16,6 +16,6 @@ This Android source package keeps the v0.10.0 audio, export, glossary and origin
 - Settings includes a separate original-image save folder.
 
 ## Building with GitHub Actions
-Upload the contents of this folder to the root of the existing private GitHub repository and push to `main`. The included workflow builds and publishes `Howie-Translate-v0.10.1-test.apk` as a GitHub Actions artifact.
+Upload the contents of this folder to the root of the existing private GitHub repository and push to `main`. The included workflow builds and publishes `Howie-Translate-v0.10.2-test.apk` as a GitHub Actions artifact.
 
-See `GITHUB_UPLOAD_INSTRUCTIONS.txt` for the simple upload steps and `CHANGELOG_v0.10.1.md` for technical details.
+See `GITHUB_UPLOAD_INSTRUCTIONS.txt` for the simple upload steps and `CHANGELOG_v0.10.2.md` for technical details.

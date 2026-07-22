@@ -1,17 +1,17 @@
-HOW TO BUILD HOWIE TRANSLATE v0.10.1
+HOW TO BUILD HOWIE TRANSLATE v0.10.2
 
 1. Extract this ZIP.
 2. Open the local howie-development-space repository folder.
 3. Delete the old project files, but keep the hidden .git folder.
 4. Copy everything inside this extracted howie_translate_src folder into the repository folder.
 5. Open GitHub Desktop.
-6. Enter summary: Build Howie Translate v0.10.1 translation startup fixes
+6. Enter summary: Build Howie Translate v0.10.2 translation startup fixes
 7. Click Commit to main.
 8. Click Push origin.
 9. Open the repository on GitHub and select Actions.
 10. Open the completed Build Howie Translate APK run.
-11. Under Artifacts, download Howie-Translate-v0.10.1-test-APK.
-12. Unzip that artifact and install Howie-Translate-v0.10.1-test.apk.
+11. Under Artifacts, download Howie-Translate-v0.10.2-test-APK.
+12. Unzip that artifact and install Howie-Translate-v0.10.2-test.apk.
 
 TEST FIRST
 - Translate a short English phrase into Chinese, then translate the result back into English.

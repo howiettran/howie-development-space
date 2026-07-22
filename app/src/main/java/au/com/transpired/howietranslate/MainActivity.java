@@ -973,7 +973,7 @@ public class MainActivity extends Activity {
 
         LinearLayout modelCard = card();
         modelCard.addView(text("Offline translation models", 19, TEXT, true));
-        modelCard.addView(text("Download English, Mandarin Chinese, Vietnamese, Thai and Malay once. Cantonese and Teo Chew share the Chinese writing model. Translation then runs on the phone without an internet connection.", 14, MUTED, false), marginTop(matchWrap(), 6));
+        modelCard.addView(text("Prepare English, Mandarin Chinese, Vietnamese, Thai and Malay once. Cantonese and Teo Chew share the Chinese writing model. The app now prepares each language independently so one failed download cannot hold up every other model.", 14, MUTED, false), marginTop(matchWrap(), 6));
         TextView modelStatus = text("Not checked yet", 13, DARK_BLUE, true);
         Button download = button("Download all translation models", true);
         modelCard.addView(modelStatus, marginTop(matchWrap(), 10));
@@ -1035,8 +1035,8 @@ public class MainActivity extends Activity {
         page.addView(storageCard, marginTop(matchWrap(), 10));
 
         LinearLayout about = cardTint(Color.rgb(255, 244, 246));
-        about.addView(text("Howie Translate 0.10.1 translation startup fix build", 17, RED, true));
-        about.addView(text("Fixes Translate and Start Live model preparation, prevents the interface from remaining stuck in Preparing mode, and keeps the v0.10.0 export, glossary and original-image improvements.", 14, TEXT, false), marginTop(matchWrap(), 6));
+        about.addView(text("Howie Translate 0.10.2 live-start and model-download fix build", 17, RED, true));
+        about.addView(text("Starts listening and recording without waiting for translation downloads, and prepares all translation languages independently so the Settings button cannot remain stuck on the first model.", 14, TEXT, false), marginTop(matchWrap(), 6));
         page.addView(about, marginTop(matchWrap(), 10));
 
         download.setOnClickListener(v -> {
@@ -1045,7 +1045,7 @@ public class MainActivity extends Activity {
             translationManager.prepareAll(new TranslationManager.PreparationCallback() {
                 @Override public void onProgress(String message) { runOnUiThread(() -> modelStatus.setText(message)); }
                 @Override public void onComplete() { runOnUiThread(() -> {
-                    modelStatus.setText("English, Chinese, Vietnamese, Thai and Malay models are ready ✓");
+                    modelStatus.setText("English pairs for Chinese, Vietnamese, Thai and Malay are ready ✓");
                     download.setEnabled(true);
                     toast("Offline translation models are ready.");
                 }); }
@@ -1278,7 +1278,6 @@ public class MainActivity extends Activity {
         }
         liveLanguageA = source;
         liveLanguageB = target;
-        armLivePreparationWatchdog(token);
         boolean useGoogle = conversationEngine == null || conversationEngine.getSelectedItemPosition() == 0;
         activeGoogleOnlineEngine = useGoogle;
 
@@ -1292,11 +1291,16 @@ public class MainActivity extends Activity {
                         .show();
                 return;
             }
-            prepareLiveTranslationAndStart(source, target, token);
+            // Listening and recording must never wait for a translation model download. Start the
+            // microphone first, then warm the selected pair in the background. Final phrases are
+            // queued safely until the pair becomes ready.
+            beginLiveConversation(source, target, token);
+            warmLiveTranslationPair(source, target, token);
         } else {
             ensureLiveSpeechModels(source, target, () -> {
                 if (token == liveSessionToken && liveControlState == LiveControlState.PREPARING) {
-                    prepareLiveTranslationAndStart(source, target, token);
+                    beginLiveConversation(source, target, token);
+                    warmLiveTranslationPair(source, target, token);
                 }
             });
         }
@@ -1371,35 +1375,37 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void prepareLiveTranslationAndStart(String source, String target, long token) {
-        if (token != liveSessionToken || liveControlState != LiveControlState.PREPARING) return;
-        if (conversationStatus != null) conversationStatus.setText("Checking the selected translation model. If it is not installed, the app will download it now…");
+    private void warmLiveTranslationPair(String source, String target, long token) {
         translationManager.preparePair(source, target, new TranslationManager.PreparationCallback() {
             @Override public void onProgress(String message) {
                 runOnUiThread(() -> {
-                    if (token == liveSessionToken && liveControlState == LiveControlState.PREPARING && conversationStatus != null) {
-                        conversationStatus.setText(message);
+                    if (token == liveSessionToken && liveControlState == LiveControlState.RECORDING
+                            && conversationLiveTranslation != null
+                            && conversationTranslation.getText().toString().trim().isEmpty()) {
+                        conversationLiveTranslation.setText("Translation setup: " + message);
                     }
                 });
             }
 
             @Override public void onComplete() {
                 runOnUiThread(() -> {
-                    if (token == liveSessionToken && liveControlState == LiveControlState.PREPARING) {
-                        beginLiveConversation(source, target, token);
+                    if (token == liveSessionToken && liveControlState == LiveControlState.RECORDING
+                            && conversationLiveTranslation != null
+                            && conversationTranslation.getText().toString().trim().isEmpty()) {
+                        conversationLiveTranslation.setText("Translation ready • waiting for the first phrase…");
                     }
                 });
             }
 
             @Override public void onError(String message) {
                 runOnUiThread(() -> {
-                    if (token != liveSessionToken) return;
-                    resetLiveControlsToIdle(message);
-                    new AlertDialog.Builder(MainActivity.this)
-                            .setTitle("Translation model unavailable")
-                            .setMessage(message + "\n\nConnect to the internet once so the language models can be downloaded, then try again.")
-                            .setPositiveButton("OK", null)
-                            .show();
+                    if (token != liveSessionToken || liveControlState == LiveControlState.IDLE) return;
+                    if (conversationLiveTranslation != null) {
+                        conversationLiveTranslation.setText("Listening is active. Translation setup needs attention: " + message);
+                    }
+                    if (conversationStatus != null) {
+                        conversationStatus.setText("Listening and recording continue. Connect to the internet and retry translation if captions remain unavailable.");
+                    }
                 });
             }
         });
@@ -1535,10 +1541,12 @@ public class MainActivity extends Activity {
             if (!liveConversationActive) return;
             String partial = livePartialText == null ? "" : livePartialText.trim();
             String language = livePartialLanguage;
-            if (!partial.isEmpty() && !partial.equals(lastPreviewSource) && !liveTranslationBusy) {
+            String previewTarget = otherLiveLanguage(language);
+            if (!partial.isEmpty() && !partial.equals(lastPreviewSource) && !liveTranslationBusy
+                    && translationManager.isPairReady(language, previewTarget)) {
                 lastPreviewSource = partial;
                 int generation = partial.hashCode();
-                String target = otherLiveLanguage(language);
+                String target = previewTarget;
                 translationManager.translatePrepared(language, target, partial, new TranslationManager.Callback() {
                     @Override public void onStatus(String status) { }
                     @Override public void onSuccess(String translatedText) {
