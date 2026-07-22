@@ -4,6 +4,8 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -11,6 +13,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaPlayer;
@@ -22,7 +25,10 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Environment;
 import android.provider.Settings;
+import android.provider.DocumentsContract;
+import android.provider.OpenableColumns;
 import android.provider.MediaStore;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
@@ -63,6 +69,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -74,6 +81,8 @@ import java.util.Map;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     private static final String HISTORY_ONLY_MARKER = AppDatabase.HISTORY_ONLY_MARKER;
@@ -83,10 +92,17 @@ public class MainActivity extends Activity {
     private static final int REQUEST_OCR_GALLERY = 913;
     private static final int REQUEST_MP3_FOLDER = 914;
     private static final int REQUEST_MP4_FOLDER = 915;
+    private static final int REQUEST_IMAGE_FOLDER = 916;
     private static final String SAVED_CONVERSATION_MARKER = "[SAVED_CONVERSATION]";
     private static final String SAVED_COPY_MARKER = "[SAVED_COPY]";
     private static final String SAVED_SOURCE_PREFIX = "[SAVED_SOURCE:";
     private Uri pendingOcrCameraUri;
+    private File pendingOcrCameraFile;
+    private String activeOcrImagePath = "";
+    private boolean activeOcrImagePendingForHistory;
+    private ImageView activeOcrPreview;
+    private TextView activeOcrImageStatus;
+    private final ExecutorService storageExecutor = Executors.newSingleThreadExecutor();
 
     private static final String[] LANGUAGE_NAMES = LanguageSupport.NAMES;
     private static final String[] LANGUAGE_CODES = LanguageSupport.CODES;
@@ -207,7 +223,7 @@ public class MainActivity extends Activity {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         db = new AppDatabase(this);
         repairAudioLinks();
-        translationManager = new TranslationManager();
+        translationManager = new TranslationManager(db);
         offlineSpeechManager = new OfflineSpeechManager(this);
         streamingSpeechManager = new StreamingSpeechManager(this, offlineSpeechManager);
         googleOnlineSpeechManager = new GoogleOnlineSpeechManager(this);
@@ -226,6 +242,7 @@ public class MainActivity extends Activity {
         if (googleOnlineSpeechManager != null) googleOnlineSpeechManager.close();
         if (streamingSpeechManager != null) streamingSpeechManager.close();
         if (exportManager != null) exportManager.close();
+        storageExecutor.shutdownNow();
         if (offlineSpeechManager != null) offlineSpeechManager.close();
         translationManager.close();
         if (latinTextRecognizer != null) latinTextRecognizer.close();
@@ -367,6 +384,27 @@ public class MainActivity extends Activity {
         imageActions.addView(uploadImage, uploadLp);
         page.addView(imageActions, marginTop(matchWrap(), 8));
 
+        LinearLayout imagePreviewCard = cardTint(Color.rgb(247, 250, 255));
+        activeOcrPreview = new ImageView(this);
+        activeOcrPreview.setAdjustViewBounds(true);
+        activeOcrPreview.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        activeOcrPreview.setVisibility(View.GONE);
+        activeOcrImageStatus = text("No image attached to the next translation.", 13, MUTED, false);
+        LinearLayout imagePreviewActions = horizontal();
+        Button viewOcrImage = button("View original", false);
+        Button removeOcrImage = button("Remove image", false);
+        imagePreviewActions.addView(viewOcrImage, new LinearLayout.LayoutParams(0, dp(44), 1));
+        LinearLayout.LayoutParams removeImageLp = new LinearLayout.LayoutParams(0, dp(44), 1);
+        removeImageLp.setMargins(dp(7), 0, 0, 0);
+        imagePreviewActions.addView(removeOcrImage, removeImageLp);
+        imagePreviewCard.addView(activeOcrPreview,
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(190)));
+        imagePreviewCard.addView(activeOcrImageStatus, marginTop(matchWrap(), 8));
+        imagePreviewCard.addView(imagePreviewActions, marginTop(matchWrap(), 8));
+        page.addView(imagePreviewCard, marginTop(matchWrap(), 8));
+        viewOcrImage.setOnClickListener(v -> showImageViewer(activeOcrImagePath));
+        removeOcrImage.setOnClickListener(v -> clearOcrImageSelection());
+
         Button translate = button("Translate", true);
         page.addView(translate, marginTop(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)), 12));
 
@@ -414,6 +452,7 @@ public class MainActivity extends Activity {
             result.setText("Your translation will appear here.");
             pinyin.setText("");
             status.setText("");
+            clearOcrImageSelection();
         });
         listen.setOnClickListener(v -> startSpeechInput(codeOf(source), recognised -> {
             input.setText(recognised);
@@ -426,6 +465,7 @@ public class MainActivity extends Activity {
                 File cameraDir = new File(getCacheDir(), "ocr_camera");
                 if (!cameraDir.exists()) cameraDir.mkdirs();
                 File imageFile = File.createTempFile("howie_ocr_", ".jpg", cameraDir);
+                pendingOcrCameraFile = imageFile;
                 pendingOcrCameraUri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", imageFile);
                 Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
                 intent.putExtra(MediaStore.EXTRA_OUTPUT, pendingOcrCameraUri);
@@ -658,13 +698,16 @@ public class MainActivity extends Activity {
             TextView title = text(item.title, 18, TEXT, true);
             boolean savedHasAudio = item.path != null && !item.path.trim().isEmpty()
                     && new File(item.path).isFile() && new File(item.path).length() > 1024L;
+            boolean savedHasImage = validImagePath(item.imagePath);
             TextView meta = text(languageName(item.sourceLanguage) + " → " + languageName(item.targetLanguage)
                     + "  •  " + formatDuration(item.durationMs) + "  •  " + formatDate(item.createdAt)
-                    + "  •  " + (savedHasAudio ? "Audio available" : "Transcript only"), 12, MUTED, false);
+                    + "  •  " + (savedHasAudio ? "Audio available" : "Transcript only")
+                    + (savedHasImage ? "  •  Original image" : ""), 12, MUTED, false);
             TextView preview = text(ellipsize(item.transcript.isEmpty() ? "No subtitle added" : ensureTranscriptNumbering(item.transcript), 150), 14, TEXT, false);
             card.addView(title);
             card.addView(meta, marginTop(matchWrap(), 4));
             card.addView(preview, marginTop(matchWrap(), 8));
+            addOriginalImageToContainer(card, item);
 
             LinearLayout actions = horizontal();
             Button play = button("▶ Open", false);
@@ -746,13 +789,16 @@ public class MainActivity extends Activity {
             recordCard.addView(top);
             boolean historyHasAudio = item.path != null && !item.path.trim().isEmpty()
                     && new File(item.path).isFile() && new File(item.path).length() > 1024L;
+            boolean historyHasImage = validImagePath(item.imagePath);
             recordCard.addView(text(item.category + "  •  " + languageName(item.sourceLanguage) + " → "
                     + languageName(item.targetLanguage) + "  •  " + formatDuration(item.durationMs)
-                    + "  •  " + (historyHasAudio ? "Audio available" : "Transcript only"), 12, MUTED, false), marginTop(matchWrap(), 4));
+                    + "  •  " + (historyHasAudio ? "Audio available" : "Transcript only")
+                    + (historyHasImage ? "  •  Original image" : ""), 12, MUTED, false), marginTop(matchWrap(), 4));
             recordCard.addView(text(formatDate(item.createdAt), 12, MUTED, false), marginTop(matchWrap(), 2));
             String previewText = item.transcript == null || item.transcript.trim().isEmpty()
                     ? "No original transcript" : ensureTranscriptNumbering(item.transcript);
             recordCard.addView(text(ellipsize(previewText, 190), 14, TEXT, false), marginTop(matchWrap(), 8));
+            addOriginalImageToContainer(recordCard, item);
 
             LinearLayout actions = horizontal();
             Button open = button("Open", true);
@@ -959,20 +1005,25 @@ public class MainActivity extends Activity {
         page.addView(speechCard, marginTop(matchWrap(), 10));
 
         LinearLayout exportCard = card();
-        exportCard.addView(text("MP3 and MP4 save locations", 19, TEXT, true));
-        exportCard.addView(text("Choose separate Android folders for audio and video exports. The app will remember both locations.", 14, MUTED, false), marginTop(matchWrap(), 6));
+        exportCard.addView(text("MP3, MP4 and image save locations", 19, TEXT, true));
+        exportCard.addView(text("Choose separate Android folders for audio, video and original OCR images. Protected app copies remain linked to History and Saved even if the external folder changes.", 14, MUTED, false), marginTop(matchWrap(), 6));
         TextView mp3FolderLabel = text(getExportFolderLabel("mp3_export_tree_uri", "MP3"), 13, DARK_BLUE, false);
         TextView mp4FolderLabel = text(getExportFolderLabel("mp4_export_tree_uri", "MP4"), 13, DARK_BLUE, false);
+        TextView imageFolderLabel = text(getExportFolderLabel("image_export_tree_uri", "Image"), 13, DARK_BLUE, false);
         Button chooseMp3Folder = button("Choose MP3 folder", false);
         Button chooseMp4Folder = button("Choose MP4 folder", false);
+        Button chooseImageFolder = button("Choose image folder", false);
         exportCard.addView(mp3FolderLabel, marginTop(matchWrap(), 10));
         exportCard.addView(chooseMp3Folder, marginTop(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)), 7));
         exportCard.addView(mp4FolderLabel, marginTop(matchWrap(), 12));
         exportCard.addView(chooseMp4Folder, marginTop(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)), 7));
+        exportCard.addView(imageFolderLabel, marginTop(matchWrap(), 12));
+        exportCard.addView(chooseImageFolder, marginTop(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)), 7));
         page.addView(exportCard, marginTop(matchWrap(), 10));
 
         chooseMp3Folder.setOnClickListener(v -> openExportFolderPicker(REQUEST_MP3_FOLDER));
         chooseMp4Folder.setOnClickListener(v -> openExportFolderPicker(REQUEST_MP4_FOLDER));
+        chooseImageFolder.setOnClickListener(v -> openExportFolderPicker(REQUEST_IMAGE_FOLDER));
 
         LinearLayout storageCard = card();
         storageCard.addView(text("Storage and uninstall", 19, TEXT, true));
@@ -982,8 +1033,8 @@ public class MainActivity extends Activity {
         page.addView(storageCard, marginTop(matchWrap(), 10));
 
         LinearLayout about = cardTint(Color.rgb(255, 244, 246));
-        about.addView(text("Howie Translate 0.9.2 durable conversation audio build", 17, RED, true));
-        about.addView(text("Adds Thai, Malay, Cantonese and Teo Chew selections; sequential translation-model downloads; model and translation timeouts; Chinese-script OCR; and editable OCR review. Cantonese and Teo Chew are best-effort dialect modes that use Chinese writing models.", 14, TEXT, false), marginTop(matchWrap(), 6));
+        about.addView(text("Howie Translate 0.10.0 export, accuracy and image-history build", 17, RED, true));
+        about.addView(text("Rebuilds MP3/MP4 export so failures no longer close the app, protects user glossary terms during translation, and retains each original OCR image through History and Saved with a selectable image folder.", 14, TEXT, false), marginTop(matchWrap(), 6));
         page.addView(about, marginTop(matchWrap(), 10));
 
         download.setOnClickListener(v -> {
@@ -1795,16 +1846,19 @@ public class MainActivity extends Activity {
 
         Models.RecordingItem existingSaved = db.getSavedCopyForSource(source.id);
         if (existingSaved != null) {
-            // Repair an older transcript-only Saved row when its History audio still exists.
-            if (!validAudioPath(existingSaved.path) && sourceAudio != null) {
-                try {
+            // Repair an older transcript-only Saved row when its History audio or image still exists.
+            try {
+                if (!validAudioPath(existingSaved.path) && sourceAudio != null) {
                     existingSaved.path = copyAudioToSavedStorage(sourceAudio, source.id);
                     existingSaved.durationMs = Math.max(existingSaved.durationMs, source.durationMs);
-                    db.updateRecording(existingSaved);
-                } catch (IOException e) {
-                    if (showErrors) showAudioSaveError(e);
-                    return null;
                 }
+                if (!validImagePath(existingSaved.imagePath) && validImagePath(source.imagePath)) {
+                    existingSaved.imagePath = copyImageToSavedStorage(new File(source.imagePath), source.id);
+                }
+                db.updateRecording(existingSaved);
+            } catch (IOException e) {
+                if (showErrors) showAudioSaveError(e);
+                return null;
             }
             return existingSaved;
         }
@@ -1821,6 +1875,16 @@ public class MainActivity extends Activity {
         saved.createdAt = System.currentTimeMillis();
         saved.sortOrder = 0;
         saved.notes = cleanSavedNotes(source.notes, source.id);
+        if (validImagePath(source.imagePath)) {
+            try {
+                saved.imagePath = copyImageToSavedStorage(new File(source.imagePath), source.id);
+            } catch (IOException e) {
+                if (showErrors) showAudioSaveError(e);
+                return null;
+            }
+        } else {
+            saved.imagePath = "";
+        }
 
         if (sourceAudio != null) {
             try {
@@ -1835,6 +1899,7 @@ public class MainActivity extends Activity {
         saved.id = db.insertRecording(saved);
         if (saved.id <= 0) {
             if (validAudioPath(saved.path)) new File(saved.path).delete();
+            if (validImagePath(saved.imagePath)) new File(saved.imagePath).delete();
             if (showErrors) toast("The conversation could not be added to Saved.");
             return null;
         }
@@ -1843,8 +1908,8 @@ public class MainActivity extends Activity {
 
     private void showAudioSaveError(IOException e) {
         new AlertDialog.Builder(this)
-                .setTitle("Audio could not be saved")
-                .setMessage("The History conversation is still safe, but its audio could not be copied to Saved. "
+                .setTitle("Media could not be saved")
+                .setMessage("The History item is still safe, but its audio or original image could not be copied to Saved. "
                         + (e.getMessage() == null ? "Please try again." : e.getMessage()))
                 .setPositiveButton("OK", null)
                 .show();
@@ -1885,23 +1950,36 @@ public class MainActivity extends Activity {
     }
 
     private Models.RecordingItem repairAnyAudioIfPossible(Models.RecordingItem item) {
-        if (item == null || validAudioPath(item.path)) return item;
+        if (item == null) return null;
         if (item.notes != null && item.notes.contains(SAVED_COPY_MARKER)) {
             long sourceId = savedSourceId(item.notes);
             Models.RecordingItem source = sourceId > 0 ? db.getRecording(sourceId) : null;
             source = repairHistoryAudioIfPossible(source,
                     source != null && source.id == currentHistoryId ? currentRecordingFile : null);
-            File sourceAudio = resolveAudioFile(source);
-            if (sourceAudio != null) {
+            boolean changed = false;
+            if (!validAudioPath(item.path)) {
+                File sourceAudio = resolveAudioFile(source);
+                if (sourceAudio != null) {
+                    try {
+                        item.path = copyAudioToSavedStorage(sourceAudio, sourceId);
+                        changed = true;
+                    } catch (IOException ignored) { }
+                }
+            }
+            if (!validImagePath(item.imagePath) && source != null && validImagePath(source.imagePath)) {
                 try {
-                    item.path = copyAudioToSavedStorage(sourceAudio, sourceId);
-                    db.updateRecording(item);
+                    item.imagePath = copyImageToSavedStorage(new File(source.imagePath), sourceId);
+                    changed = true;
                 } catch (IOException ignored) { }
             }
+            if (changed) db.updateRecording(item);
             return item;
         }
-        return repairHistoryAudioIfPossible(item,
-                item.id == currentHistoryId ? currentRecordingFile : null);
+        if (!validAudioPath(item.path)) {
+            return repairHistoryAudioIfPossible(item,
+                    item.id == currentHistoryId ? currentRecordingFile : null);
+        }
+        return item;
     }
 
     private void repairAudioLinks() {
@@ -1916,7 +1994,7 @@ public class MainActivity extends Activity {
         items = db.getAllRecordings();
         for (Models.RecordingItem item : items) {
             if (item.notes != null && item.notes.contains(SAVED_COPY_MARKER)
-                    && !validAudioPath(item.path)) {
+                    && (!validAudioPath(item.path) || !validImagePath(item.imagePath))) {
                 repairAnyAudioIfPossible(item);
             }
         }
@@ -2075,6 +2153,27 @@ public class MainActivity extends Activity {
         return destination.getAbsolutePath();
     }
 
+    private String copyImageToSavedStorage(File source, long sourceId) throws IOException {
+        if (source == null || !source.isFile() || source.length() <= 0L) {
+            throw new IOException("The source image is missing or incomplete.");
+        }
+        File dir = new File(getFilesDir(), "saved_images");
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IOException("The Saved image folder could not be created.");
+        }
+        File destination = new File(dir, "saved_image_" + sourceId + "_"
+                + System.currentTimeMillis() + imageExtension(source.getName()));
+        try (InputStream input = new FileInputStream(source);
+             OutputStream output = new FileOutputStream(destination)) {
+            copyStream(input, output);
+        }
+        if (!destination.isFile() || destination.length() != source.length()) {
+            destination.delete();
+            throw new IOException("The Saved image copy could not be verified.");
+        }
+        return destination.getAbsolutePath();
+    }
+
     private void confirmNewConversation() {
         if (isRecording || liveConversationActive) {
             toast("Stop the live recording before starting a new conversation.");
@@ -2142,9 +2241,12 @@ public class MainActivity extends Activity {
     private void autoSaveTypedHistory(String source, String target, String original, String translated) {
         if (original == null || translated == null || original.trim().isEmpty() || translated.trim().isEmpty()) return;
         Models.RecordingItem item = new Models.RecordingItem();
-        item.title = "Typed translation " + formatDate(System.currentTimeMillis());
-        item.category = "Typed Translations";
+        item.title = (activeOcrImagePendingForHistory ? "Image translation " : "Typed translation ")
+                + formatDate(System.currentTimeMillis());
+        item.category = activeOcrImagePendingForHistory ? "Image Translations" : "Typed Translations";
         item.path = "";
+        item.imagePath = activeOcrImagePendingForHistory && validImagePath(activeOcrImagePath)
+                ? activeOcrImagePath : "";
         item.sourceLanguage = source;
         item.targetLanguage = target;
         item.transcript = "1. [00:00] " + languageName(source) + ": " + original.trim();
@@ -2153,7 +2255,11 @@ public class MainActivity extends Activity {
                 : (LanguageSupport.isChineseScript(source) ? original : "");
         item.pinyin = chinese.isEmpty() ? "" : "1. [00:00] " + PinyinUtil.toPinyin(chinese);
         item.notes = HISTORY_ONLY_MARKER;
-        db.insertRecording(item);
+        long inserted = db.insertRecording(item);
+        if (inserted > 0 && validImagePath(item.imagePath)) {
+            activeOcrImagePendingForHistory = false;
+            updateOcrImagePreview("Original image retained in History and in the selected image folder.");
+        }
     }
 
     private void autoSaveLiveHistory() {
@@ -2222,6 +2328,7 @@ public class MainActivity extends Activity {
         }
         body.addView(text("TRANSLATION", 11, RED, true), marginTop(matchWrap(), 14));
         body.addView(text(item.translation == null || item.translation.isEmpty() ? "No translation." : ensureTranscriptNumbering(item.translation), 16, TEXT, false), marginTop(matchWrap(), 5));
+        addOriginalImageToContainer(body, item);
         new AlertDialog.Builder(this).setTitle(item.title).setView(wrapDialog(body)).setPositiveButton("Close", null).show();
     }
 
@@ -2271,6 +2378,7 @@ public class MainActivity extends Activity {
         if (!playerItem.pinyin.isEmpty()) body.addView(py, marginTop(matchWrap(), 5));
         body.addView(text("TRANSLATION", 11, RED, true), marginTop(matchWrap(), 14));
         body.addView(translated, marginTop(matchWrap(), 5));
+        addOriginalImageToContainer(body, playerItem);
 
         SeekBar seek = new SeekBar(this);
         TextView time = text("00:00 / " + formatDuration(playerItem.durationMs), 13, MUTED, false);
@@ -2427,13 +2535,27 @@ public class MainActivity extends Activity {
                         .show();
             }
         };
-        if (karaoke) exportManager.exportKaraokeMp4(exportItem, callback); else exportManager.exportMp3(exportItem, callback);
+        try {
+            if (karaoke) {
+                exportManager.exportKaraokeMp4(exportItem, callback);
+            } else {
+                exportManager.exportMp3(exportItem, callback);
+            }
+        } catch (Throwable failure) {
+            dialog.dismiss();
+            new AlertDialog.Builder(this)
+                    .setTitle("Export could not start")
+                    .setMessage("The export service could not be started safely. Reopen the app and try again. "
+                            + (failure.getMessage() == null ? "" : failure.getMessage()))
+                    .setPositiveButton("OK", null)
+                    .show();
+        }
     }
 
     private void showExportComplete(Uri uri, String displayName, String mimeType) {
         new AlertDialog.Builder(this)
                 .setTitle("Export saved")
-                .setMessage(displayName + " was saved in Downloads/Howie Translate.")
+                .setMessage(displayName + " was saved successfully to the folder selected in Settings.")
                 .setNegativeButton("Close", null)
                 .setNeutralButton("Share", (d, w) -> shareExport(uri, mimeType))
                 .setPositiveButton("Open", (d, w) -> openExport(uri, mimeType))
@@ -2505,15 +2627,21 @@ public class MainActivity extends Activity {
     private void confirmDeleteRecording(Models.RecordingItem item, Runnable afterDelete) {
         new AlertDialog.Builder(this)
                 .setTitle("Delete this item?")
-                .setMessage("This removes this History or Saved item. A shared audio file is only deleted when no other record still uses it.")
+                .setMessage("This removes this History or Saved item. Shared audio and image files are only deleted when no other record still uses them.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Delete", (d, w) -> {
                     String path = item.path == null ? "" : item.path.trim();
+                    String imagePath = item.imagePath == null ? "" : item.imagePath.trim();
                     boolean shared = db.hasOtherRecordingUsingPath(path, item.id);
+                    boolean imageShared = db.hasOtherRecordingUsingImagePath(imagePath, item.id);
                     db.deleteRecording(item.id);
                     if (!shared && !path.isEmpty()) {
                         File f = new File(path);
                         if (f.isFile()) f.delete();
+                    }
+                    if (!imageShared && !imagePath.isEmpty()) {
+                        File image = new File(imagePath);
+                        if (image.isFile()) image.delete();
                     }
                     persistentPages.remove("history");
                     persistentPages.remove("saved");
@@ -2985,36 +3113,341 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != RESULT_OK) return;
         if (requestCode == REQUEST_OCR_CAMERA) {
-            if (pendingOcrCameraUri == null) {
+            if (pendingOcrCameraUri == null || pendingOcrCameraFile == null
+                    || !pendingOcrCameraFile.isFile()) {
                 toast("The camera image could not be located.");
                 return;
             }
-            try {
-                processOcrImage(InputImage.fromFilePath(this, pendingOcrCameraUri));
-            } catch (IOException e) {
-                toast("The captured image could not be opened.");
-            }
+            processOcrSource(pendingOcrCameraUri, pendingOcrCameraFile.getName());
         } else if (requestCode == REQUEST_OCR_GALLERY && data != null && data.getData() != null) {
+            Uri selected = data.getData();
             try {
-                processOcrImage(InputImage.fromFilePath(this, data.getData()));
-            } catch (IOException e) {
-                toast("The selected image could not be opened.");
-            }
-        } else if ((requestCode == REQUEST_MP3_FOLDER || requestCode == REQUEST_MP4_FOLDER)
-                && data != null && data.getData() != null) {
+                getContentResolver().takePersistableUriPermission(selected,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (SecurityException ignored) { }
+            processOcrSource(selected, queryDisplayName(selected));
+        } else if ((requestCode == REQUEST_MP3_FOLDER || requestCode == REQUEST_MP4_FOLDER
+                || requestCode == REQUEST_IMAGE_FOLDER) && data != null && data.getData() != null) {
             Uri tree = data.getData();
             try {
                 getContentResolver().takePersistableUriPermission(tree,
                         Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
             } catch (SecurityException ignored) { }
-            String key = requestCode == REQUEST_MP3_FOLDER ? "mp3_export_tree_uri" : "mp4_export_tree_uri";
-            String type = requestCode == REQUEST_MP3_FOLDER ? "MP3" : "MP4";
+            String key;
+            String type;
+            if (requestCode == REQUEST_MP3_FOLDER) {
+                key = "mp3_export_tree_uri";
+                type = "MP3";
+            } else if (requestCode == REQUEST_MP4_FOLDER) {
+                key = "mp4_export_tree_uri";
+                type = "MP4";
+            } else {
+                key = "image_export_tree_uri";
+                type = "Image";
+            }
             getSharedPreferences("howie_translate", MODE_PRIVATE).edit()
                     .putString(key, tree.toString()).apply();
             toast(type + " save location updated.");
             persistentPages.remove("settings");
             showPage("settings");
         }
+    }
+
+    private File retainOriginalImage(Uri sourceUri, String suggestedName) throws IOException {
+        File directory = new File(getFilesDir(), "history_images");
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw new IOException("The protected image folder could not be created.");
+        }
+        String extension = imageExtension(suggestedName);
+        File destination = new File(directory, "image_" + System.currentTimeMillis() + extension);
+        try (InputStream input = getContentResolver().openInputStream(sourceUri);
+             OutputStream output = new FileOutputStream(destination)) {
+            if (input == null) throw new IOException("Android could not open the selected image.");
+            copyStream(input, output);
+        } catch (Exception e) {
+            destination.delete();
+            if (e instanceof IOException) throw (IOException) e;
+            throw new IOException(e.getMessage() == null ? "The image copy failed." : e.getMessage(), e);
+        }
+        if (!destination.isFile() || destination.length() <= 0L) {
+            destination.delete();
+            throw new IOException("The retained image was empty.");
+        }
+        return destination;
+    }
+
+    private void saveImageToChosenFolder(File source, String displayName) {
+        try {
+            Uri savedUri = copyImageToUserFolder(source, displayName);
+            runOnUiThread(() -> {
+                if (activeOcrImageStatus != null && source.getAbsolutePath().equals(activeOcrImagePath)) {
+                    activeOcrImageStatus.setText("Original image retained and copied to the image folder. It will be linked to History after translation.");
+                }
+            });
+        } catch (Exception e) {
+            runOnUiThread(() -> {
+                if (activeOcrImageStatus != null && source.getAbsolutePath().equals(activeOcrImagePath)) {
+                    activeOcrImageStatus.setText("Original image retained inside the app. External image-folder copy failed: "
+                            + (e.getMessage() == null ? "storage unavailable" : e.getMessage()));
+                }
+            });
+        }
+    }
+
+    private Uri copyImageToUserFolder(File source, String displayName) throws IOException {
+        ContentResolver resolver = getContentResolver();
+        String selectedTree = getSharedPreferences("howie_translate", MODE_PRIVATE)
+                .getString("image_export_tree_uri", "");
+        String safeName = safeImageName(displayName);
+        String mimeType = imageMimeType(safeName);
+        if (selectedTree != null && !selectedTree.trim().isEmpty()) {
+            Uri treeUri = Uri.parse(selectedTree);
+            Uri parent = DocumentsContract.buildDocumentUriUsingTree(treeUri,
+                    DocumentsContract.getTreeDocumentId(treeUri));
+            Uri destination = DocumentsContract.createDocument(resolver, parent, mimeType, safeName);
+            if (destination == null) throw new IOException("The selected image folder is unavailable.");
+            try (InputStream input = new FileInputStream(source);
+                 OutputStream output = resolver.openOutputStream(destination, "w")) {
+                if (output == null) throw new IOException("The selected image folder could not be opened.");
+                copyStream(input, output);
+            }
+            return destination;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, safeName);
+            values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                    Environment.DIRECTORY_PICTURES + "/Howie Translate/Translation Images");
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            Uri uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+            if (uri == null) throw new IOException("Android could not create the image file.");
+            try (InputStream input = new FileInputStream(source);
+                 OutputStream output = resolver.openOutputStream(uri, "w")) {
+                if (output == null) throw new IOException("Android could not open the image file.");
+                copyStream(input, output);
+            } catch (Exception e) {
+                resolver.delete(uri, null, null);
+                if (e instanceof IOException) throw (IOException) e;
+                throw new IOException(e.getMessage(), e);
+            }
+            ContentValues ready = new ContentValues();
+            ready.put(MediaStore.MediaColumns.IS_PENDING, 0);
+            resolver.update(uri, ready, null, null);
+            return uri;
+        }
+        File root = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
+        if (root == null) throw new IOException("Pictures storage is unavailable.");
+        File folder = new File(root, "Howie Translate/Translation Images");
+        if (!folder.exists() && !folder.mkdirs()) throw new IOException("The image folder could not be created.");
+        File destination = uniqueImageFile(folder, safeName);
+        try (InputStream input = new FileInputStream(source);
+             OutputStream output = new FileOutputStream(destination)) {
+            copyStream(input, output);
+        }
+        return FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", destination);
+    }
+
+    private File uniqueImageFile(File folder, String displayName) {
+        File candidate = new File(folder, displayName);
+        if (!candidate.exists()) return candidate;
+        int dot = displayName.lastIndexOf('.');
+        String base = dot > 0 ? displayName.substring(0, dot) : displayName;
+        String extension = dot > 0 ? displayName.substring(dot) : "";
+        int number = 2;
+        while (candidate.exists()) candidate = new File(folder, base + " (" + number++ + ")" + extension);
+        return candidate;
+    }
+
+    private void copyStream(InputStream input, OutputStream output) throws IOException {
+        byte[] buffer = new byte[64 * 1024];
+        int read;
+        while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+        output.flush();
+    }
+
+    private String queryDisplayName(Uri uri) {
+        if (uri == null) return "translation-image.jpg";
+        android.database.Cursor cursor = null;
+        try {
+            cursor = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME},
+                    null, null, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                String value = cursor.getString(0);
+                if (value != null && !value.trim().isEmpty()) return value;
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+        return "translation-image.jpg";
+    }
+
+    private String imageExtension(String name) {
+        if (name == null) return ".jpg";
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".png")) return ".png";
+        if (lower.endsWith(".webp")) return ".webp";
+        if (lower.endsWith(".jpeg")) return ".jpeg";
+        if (lower.endsWith(".heic")) return ".heic";
+        if (lower.endsWith(".heif")) return ".heif";
+        return ".jpg";
+    }
+
+    private String safeImageName(String name) {
+        String base = name == null ? "" : name.trim();
+        if (base.isEmpty()) base = "Howie-Translate-Image-" + System.currentTimeMillis() + ".jpg";
+        base = base.replaceAll("[\\\\/:*?\"<>|]", "-").replaceAll("\\s+", " ").trim();
+        if (!base.contains(".")) base += ".jpg";
+        return base.length() > 100 ? base.substring(base.length() - 100) : base;
+    }
+
+    private String imageMimeType(String name) {
+        String lower = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".png")) return "image/png";
+        if (lower.endsWith(".webp")) return "image/webp";
+        if (lower.endsWith(".heic") || lower.endsWith(".heif")) return "image/heic";
+        return "image/jpeg";
+    }
+
+    private void updateOcrImagePreview(String message) {
+        if (activeOcrPreview != null) {
+            Bitmap bitmap = decodeSampledBitmap(activeOcrImagePath, 900, 500);
+            activeOcrPreview.setImageBitmap(bitmap);
+            activeOcrPreview.setVisibility(bitmap == null ? View.GONE : View.VISIBLE);
+        }
+        if (activeOcrImageStatus != null) activeOcrImageStatus.setText(message);
+    }
+
+    private void clearOcrImageSelection() {
+        if (activeOcrImagePendingForHistory && validImagePath(activeOcrImagePath)) {
+            new File(activeOcrImagePath).delete();
+        }
+        activeOcrImagePath = "";
+        activeOcrImagePendingForHistory = false;
+        if (activeOcrPreview != null) {
+            activeOcrPreview.setImageDrawable(null);
+            activeOcrPreview.setVisibility(View.GONE);
+        }
+        if (activeOcrImageStatus != null) {
+            activeOcrImageStatus.setText("No image attached to the next translation.");
+        }
+    }
+
+    private boolean validImagePath(String path) {
+        if (path == null || path.trim().isEmpty()) return false;
+        File file = new File(path);
+        return file.isFile() && file.length() > 0L;
+    }
+
+    private Bitmap decodeSampledBitmap(String path, int requiredWidth, int requiredHeight) {
+        if (!validImagePath(path)) return null;
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(path, bounds);
+            int sample = 1;
+            while (bounds.outWidth / sample > requiredWidth * 2
+                    || bounds.outHeight / sample > requiredHeight * 2) sample *= 2;
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = Math.max(1, sample);
+            return BitmapFactory.decodeFile(path, options);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private void showImageViewer(String path) {
+        if (!validImagePath(path)) {
+            toast("The original image is unavailable.");
+            return;
+        }
+        ImageView image = new ImageView(this);
+        image.setAdjustViewBounds(true);
+        image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        image.setImageBitmap(decodeSampledBitmap(path, 1600, 1600));
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(image);
+        new AlertDialog.Builder(this)
+                .setTitle("Original translation image")
+                .setView(scroll)
+                .setNegativeButton("Close", null)
+                .setNeutralButton("Share", (dialog, which) -> shareImage(path))
+                .setPositiveButton("Open full size", (dialog, which) -> openImage(path))
+                .show();
+    }
+
+    private void openImage(String path) {
+        try {
+            File file = new File(path);
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", file);
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, imageMimeType(file.getName()));
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(intent);
+        } catch (Exception e) {
+            toast("No app is available to open this image.");
+        }
+    }
+
+    private void shareImage(String path) {
+        try {
+            File file = new File(path);
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", file);
+            Intent share = new Intent(Intent.ACTION_SEND);
+            share.setType(imageMimeType(file.getName()));
+            share.putExtra(Intent.EXTRA_STREAM, uri);
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(share, "Share original image"));
+        } catch (Exception e) {
+            toast("The original image could not be shared.");
+        }
+    }
+
+    private void addOriginalImageToContainer(LinearLayout container, Models.RecordingItem item) {
+        if (container == null || item == null || !validImagePath(item.imagePath)) return;
+        container.addView(text("ORIGINAL IMAGE", 11, BLUE, true), marginTop(matchWrap(), 12));
+        ImageView preview = new ImageView(this);
+        preview.setAdjustViewBounds(true);
+        preview.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        preview.setImageBitmap(decodeSampledBitmap(item.imagePath, 900, 520));
+        preview.setOnClickListener(v -> showImageViewer(item.imagePath));
+        container.addView(preview, marginTop(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(190)), 6));
+        Button view = button("View / share original image", false);
+        view.setOnClickListener(v -> showImageViewer(item.imagePath));
+        container.addView(view, marginTop(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44)), 7));
+    }
+
+    private void processOcrSource(Uri sourceUri, String suggestedName) {
+        if (sourceUri == null) {
+            toast("The selected image could not be opened.");
+            return;
+        }
+        if (activeOcrImageStatus != null) activeOcrImageStatus.setText("Retaining the original image…");
+        storageExecutor.execute(() -> {
+            try {
+                File retained = retainOriginalImage(sourceUri, suggestedName);
+                runOnUiThread(() -> {
+                    activeOcrImagePath = retained.getAbsolutePath();
+                    activeOcrImagePendingForHistory = true;
+                    updateOcrImagePreview("Original image retained. It will be linked to History after translation.");
+                    try {
+                        processOcrImage(InputImage.fromFilePath(this, Uri.fromFile(retained)));
+                    } catch (IOException e) {
+                        toast("The retained image could not be opened for OCR.");
+                    }
+                });
+                saveImageToChosenFolder(retained, retained.getName());
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    clearOcrImageSelection();
+                    toast("The original image could not be retained: "
+                            + (e.getMessage() == null ? "Unknown storage error" : e.getMessage()));
+                });
+            }
+        });
     }
 
     private void processOcrImage(InputImage image) {
@@ -3130,19 +3563,27 @@ public class MainActivity extends Activity {
                 item.id == currentHistoryId ? currentRecordingFile : null);
         Models.RecordingItem existingSaved = db.getSavedCopyForSource(item.id);
         boolean hasAudio = validAudioPath(item.path);
+        boolean hasImage = validImagePath(item.imagePath);
         boolean existingHasAudio = existingSaved != null && validAudioPath(existingSaved.path);
-        if (existingHasAudio) {
-            toast("This conversation and its audio are already in Saved.");
+        boolean existingHasImage = existingSaved != null && validImagePath(existingSaved.imagePath);
+        boolean audioComplete = !hasAudio || existingHasAudio;
+        boolean imageComplete = !hasImage || existingHasImage;
+        if (existingSaved != null && audioComplete && imageComplete) {
+            toast("This conversation and its available media are already in Saved.");
             return;
         }
-        String title = existingSaved == null ? "Save conversation" : "Repair Saved audio";
+        String title = existingSaved == null ? "Save conversation" : "Repair Saved media";
         String message;
-        if (existingSaved != null && hasAudio) {
-            message = "The Saved transcript exists, but its audio link is missing. A fresh protected audio copy will be created from History.";
+        if (existingSaved != null) {
+            message = "The Saved transcript exists, but one or more linked media files are missing. Fresh protected copies will be created from History where available.";
+        } else if (hasAudio && hasImage) {
+            message = "Separate protected copies of the conversation, audio and original image will be created. History will remain untouched.";
         } else if (hasAudio) {
             message = "A separate copy of the conversation and audio will be created. The original History audio will remain untouched.";
+        } else if (hasImage) {
+            message = "A separate copy of the conversation and original image will be created. The History image will remain untouched.";
         } else {
-            message = "This conversation has no reusable audio file. Its transcript and translation can still be saved.";
+            message = "This conversation has no reusable audio or image file. Its transcript and translation can still be saved.";
         }
         final Models.RecordingItem sourceItem = item;
         new AlertDialog.Builder(this)
@@ -3152,9 +3593,11 @@ public class MainActivity extends Activity {
                 .setPositiveButton(existingSaved == null ? "Save" : "Repair", (dialog, which) -> {
                     Models.RecordingItem saved = createSavedCopy(sourceItem, true);
                     if (saved == null) return;
-                    toast(validAudioPath(saved.path)
+                    String savedMessage = validAudioPath(saved.path)
                             ? "Conversation and audio are available in Saved."
-                            : "Conversation saved without audio.");
+                            : "Conversation saved without audio.";
+                    if (validImagePath(saved.imagePath)) savedMessage += " Original image retained.";
+                    toast(savedMessage);
                     persistentPages.remove("saved");
                     persistentPages.remove("history");
                     refresh.run();

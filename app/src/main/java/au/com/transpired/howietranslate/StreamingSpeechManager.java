@@ -57,11 +57,11 @@ final class StreamingSpeechManager {
     private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO;
     private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
     private static final int FRAME_SAMPLES = 320;             // 20 ms at 16 kHz
-    private static final int PRE_ROLL_FRAMES = 25;            // 500 ms
-    private static final int START_VOICE_FRAMES = 3;          // 60 ms
-    private static final int END_SILENCE_FRAMES = 40;         // 800 ms
-    private static final int MIN_PHRASE_FRAMES = 25;          // 500 ms
-    private static final int MAX_PHRASE_FRAMES = 400;         // 8.0 sec
+    private static final int PRE_ROLL_FRAMES = 35;            // 700 ms: retain more of the start of quiet speech
+    private static final int START_VOICE_FRAMES = 2;          // 40 ms: react sooner so opening words are not clipped
+    private static final int END_SILENCE_FRAMES = 55;         // 1.1 sec: keep natural pauses inside one sentence
+    private static final int MIN_PHRASE_FRAMES = 20;          // 400 ms: retain short replies and names
+    private static final int MAX_PHRASE_FRAMES = 600;         // 12 sec: give translation more sentence context
     private static final int ONE_SHOT_TIMEOUT_MS = 30000;
     private static final String MODEL_ASSET = OfflineSpeechManager.WHISPER_ASSET_PATH;
 

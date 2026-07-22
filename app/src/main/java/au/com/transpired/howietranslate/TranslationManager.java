@@ -11,8 +11,14 @@ import com.google.mlkit.nl.translate.Translation;
 import com.google.mlkit.nl.translate.Translator;
 import com.google.mlkit.nl.translate.TranslatorOptions;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class TranslationManager {
@@ -35,9 +41,14 @@ final class TranslationManager {
     private final Map<String, Translator> cache = new HashMap<>();
     private final RemoteModelManager modelManager = RemoteModelManager.getInstance();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final AppDatabase database;
+
+    TranslationManager(AppDatabase database) {
+        this.database = database;
+    }
 
     void translate(String source, String target, String text, Callback callback) {
-        String cleanText = text == null ? "" : text.trim();
+        String cleanText = normaliseInput(text);
         if (cleanText.isEmpty()) {
             callback.onError("Enter or dictate a phrase first.");
             return;
@@ -74,7 +85,7 @@ final class TranslationManager {
                 .addOnSuccessListener(unused -> {
                     if (!finished.compareAndSet(false, true)) return;
                     mainHandler.removeCallbacks(timeout);
-                    translatePreparedInternal(translator, cleanText, callback);
+                    translatePreparedInternal(translator, source, target, cleanText, callback);
                 })
                 .addOnFailureListener(error -> {
                     if (!finished.compareAndSet(false, true)) return;
@@ -123,7 +134,7 @@ final class TranslationManager {
     }
 
     void translatePrepared(String source, String target, String text, Callback callback) {
-        String cleanText = text == null ? "" : text.trim();
+        String cleanText = normaliseInput(text);
         if (cleanText.isEmpty()) {
             callback.onError("There is no speech to translate.");
             return;
@@ -142,7 +153,7 @@ final class TranslationManager {
             callback.onSuccess(cleanText);
             return;
         }
-        translatePreparedInternal(getTranslator(sourceMl, targetMl), cleanText, callback);
+        translatePreparedInternal(getTranslator(sourceMl, targetMl), source, target, cleanText, callback);
     }
 
     void prepareAll(PreparationCallback callback) {
@@ -155,26 +166,127 @@ final class TranslationManager {
         cache.clear();
     }
 
-    private void translatePreparedInternal(Translator translator, String text, Callback callback) {
-        callback.onStatus("Translating on your phone...");
+    private void translatePreparedInternal(Translator translator, String source, String target,
+                                           String text, Callback callback) {
+        GlossaryMask glossaryMask = buildGlossaryMask(source, target, text);
+        callback.onStatus(glossaryMask.replacements.isEmpty()
+                ? "Translating on your phone..."
+                : "Translating with your glossary terms protected...");
         AtomicBoolean finished = new AtomicBoolean(false);
         Runnable timeout = () -> {
             if (finished.compareAndSet(false, true)) {
-                callback.onError("Translation timed out. Please try the phrase again.");
+                callback.onError("Translation timed out. Please try a shorter phrase or split the text into paragraphs.");
             }
         };
         mainHandler.postDelayed(timeout, TRANSLATE_TIMEOUT_MS);
-        translator.translate(text)
+        translator.translate(glossaryMask.maskedText)
                 .addOnSuccessListener(translated -> {
                     if (!finished.compareAndSet(false, true)) return;
                     mainHandler.removeCallbacks(timeout);
-                    callback.onSuccess(translated);
+                    callback.onSuccess(cleanTranslatedOutput(glossaryMask.restore(translated), target));
                 })
                 .addOnFailureListener(error -> {
                     if (!finished.compareAndSet(false, true)) return;
                     mainHandler.removeCallbacks(timeout);
                     callback.onError("Translation could not be completed. " + readable(error));
                 });
+    }
+
+    /**
+     * Protects user-approved glossary terms before they are sent to ML Kit. The numeric tokens are
+     * deliberately language-neutral, so names, product terms and customer terminology are restored
+     * exactly after translation instead of being reworded unpredictably.
+     */
+    private GlossaryMask buildGlossaryMask(String source, String target, String text) {
+        GlossaryMask result = new GlossaryMask(text);
+        if (database == null || text == null || text.isEmpty()) return result;
+        List<Models.GlossaryItem> matches = new ArrayList<>();
+        try {
+            for (Models.GlossaryItem item : database.getGlossary("")) {
+                if (item.originalText == null || item.translatedText == null) continue;
+                if (item.originalText.trim().isEmpty() || item.translatedText.trim().isEmpty()) continue;
+                if (LanguageSupport.normalise(source).equals(LanguageSupport.normalise(item.sourceLanguage))
+                        && LanguageSupport.normalise(target).equals(LanguageSupport.normalise(item.targetLanguage))) {
+                    matches.add(item);
+                } else if (LanguageSupport.normalise(source).equals(LanguageSupport.normalise(item.targetLanguage))
+                        && LanguageSupport.normalise(target).equals(LanguageSupport.normalise(item.sourceLanguage))) {
+                    Models.GlossaryItem reversed = new Models.GlossaryItem();
+                    reversed.originalText = item.translatedText;
+                    reversed.translatedText = item.originalText;
+                    matches.add(reversed);
+                }
+            }
+        } catch (RuntimeException ignored) {
+            return result;
+        }
+        matches.sort(Comparator.comparingInt((Models.GlossaryItem i) -> i.originalText.length()).reversed());
+        int tokenNumber = 91000001;
+        for (Models.GlossaryItem item : matches) {
+            String original = item.originalText.trim();
+            if (original.length() < 2 || !containsLiteral(result.maskedText, original,
+                    LanguageSupport.isChineseScript(source) || LanguageSupport.isThai(source))) continue;
+            String token;
+            do { token = String.valueOf(tokenNumber++); }
+            while (result.maskedText.contains(token));
+            String replaced = replaceLiteral(result.maskedText, original, "[" + token + "]",
+                    LanguageSupport.isChineseScript(source) || LanguageSupport.isThai(source));
+            if (!replaced.equals(result.maskedText)) {
+                result.maskedText = replaced;
+                result.replacements.put(token, item.translatedText.trim());
+            }
+        }
+        return result;
+    }
+
+    private boolean containsLiteral(String text, String value, boolean exactCase) {
+        if (text == null || value == null) return false;
+        return exactCase ? text.contains(value)
+                : text.toLowerCase(Locale.ROOT).contains(value.toLowerCase(Locale.ROOT));
+    }
+
+    private String replaceLiteral(String text, String value, String replacement, boolean exactCase) {
+        int flags = exactCase ? 0 : Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE;
+        return Pattern.compile(Pattern.quote(value), flags).matcher(text)
+                .replaceAll(Matcher.quoteReplacement(replacement));
+    }
+
+    private String normaliseInput(String text) {
+        if (text == null) return "";
+        return text.replace('\u00a0', ' ')
+                .replaceAll("[\\t\\u000B\\f\\r]+", " ")
+                .replaceAll("[ ]{2,}", " ")
+                .replaceAll(" *\\n *", "\n")
+                .trim();
+    }
+
+    private String cleanTranslatedOutput(String text, String target) {
+        if (text == null) return "";
+        String result = text.replaceAll("[ \\t]{2,}", " ")
+                .replaceAll(" *\\n *", "\n").trim();
+        if (LanguageSupport.isChineseScript(target)) {
+            result = result.replaceAll("(?<=\\p{IsHan})\\s+(?=\\p{IsHan})", "");
+        }
+        return result;
+    }
+
+    private static final class GlossaryMask {
+        String maskedText;
+        final Map<String, String> replacements = new HashMap<>();
+
+        GlossaryMask(String maskedText) {
+            this.maskedText = maskedText == null ? "" : maskedText;
+        }
+
+        String restore(String translated) {
+            String result = translated == null ? "" : translated;
+            for (Map.Entry<String, String> entry : replacements.entrySet()) {
+                String token = entry.getKey();
+                result = result.replace("[" + token + "]", entry.getValue())
+                        .replace("【" + token + "】", entry.getValue())
+                        .replace(token, entry.getValue());
+            }
+            return result;
+        }
     }
 
     private void downloadModelSequentially(String[] models, int index, PreparationCallback callback) {

@@ -13,7 +13,7 @@ final class AppDatabase extends SQLiteOpenHelper {
     static final String HISTORY_ONLY_MARKER = "\u200B\u200C\u200D";
     static final String SAVED_COPY_MARKER = "[SAVED_COPY]";
     private static final String DB_NAME = "howie_translate.db";
-    private static final int DB_VERSION = 3;
+    private static final int DB_VERSION = 4;
 
     AppDatabase(Context context) {
         super(context, DB_NAME, null, DB_VERSION);
@@ -38,6 +38,7 @@ final class AppDatabase extends SQLiteOpenHelper {
                 "title TEXT NOT NULL," +
                 "category TEXT NOT NULL DEFAULT 'General'," +
                 "path TEXT NOT NULL," +
+                "image_path TEXT NOT NULL DEFAULT ''," +
                 "source_language TEXT NOT NULL," +
                 "target_language TEXT NOT NULL," +
                 "transcript TEXT NOT NULL DEFAULT ''," +
@@ -75,6 +76,9 @@ final class AppDatabase extends SQLiteOpenHelper {
                 cursor.close();
                 db.endTransaction();
             }
+        }
+        if (oldVersion < 4) {
+            db.execSQL("ALTER TABLE recordings ADD COLUMN image_path TEXT NOT NULL DEFAULT ''");
         }
     }
 
@@ -165,10 +169,18 @@ final class AppDatabase extends SQLiteOpenHelper {
     }
 
     boolean hasOtherRecordingUsingPath(String path, long excludingId) {
-        if (path == null || path.trim().isEmpty()) return false;
+        return hasOtherRecordingUsingColumn("path", path, excludingId);
+    }
+
+    boolean hasOtherRecordingUsingImagePath(String imagePath, long excludingId) {
+        return hasOtherRecordingUsingColumn("image_path", imagePath, excludingId);
+    }
+
+    private boolean hasOtherRecordingUsingColumn(String column, String value, long excludingId) {
+        if (value == null || value.trim().isEmpty()) return false;
         Cursor c = getReadableDatabase().rawQuery(
-                "SELECT COUNT(*) FROM recordings WHERE path=? AND id<>?",
-                new String[]{path, String.valueOf(excludingId)});
+                "SELECT COUNT(*) FROM recordings WHERE " + column + "=? AND id<>?",
+                new String[]{value, String.valueOf(excludingId)});
         try {
             return c.moveToFirst() && c.getLong(0) > 0L;
         } finally {
@@ -273,6 +285,7 @@ final class AppDatabase extends SQLiteOpenHelper {
         v.put("title", safe(item.title));
         v.put("category", cleanCategory(item.category));
         v.put("path", safe(item.path));
+        v.put("image_path", safe(item.imagePath));
         v.put("source_language", safe(item.sourceLanguage));
         v.put("target_language", safe(item.targetLanguage));
         v.put("transcript", safe(item.transcript));
@@ -306,6 +319,8 @@ final class AppDatabase extends SQLiteOpenHelper {
         i.title = c.getString(c.getColumnIndexOrThrow("title"));
         i.category = c.getString(c.getColumnIndexOrThrow("category"));
         i.path = c.getString(c.getColumnIndexOrThrow("path"));
+        int imageColumn = c.getColumnIndex("image_path");
+        i.imagePath = imageColumn >= 0 ? c.getString(imageColumn) : "";
         i.sourceLanguage = c.getString(c.getColumnIndexOrThrow("source_language"));
         i.targetLanguage = c.getString(c.getColumnIndexOrThrow("target_language"));
         i.transcript = c.getString(c.getColumnIndexOrThrow("transcript"));

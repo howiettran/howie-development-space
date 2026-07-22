@@ -21,6 +21,7 @@ final class Models {
         String title = "";
         String category = "General";
         String path = "";
+        String imagePath = "";
         String sourceLanguage = "en";
         String targetLanguage = "zh";
         String transcript = "";

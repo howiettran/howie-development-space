@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <cache-path name="ocr_camera" path="ocr_camera/" />
+    <cache-path name="export_cache" path="exports/" />
+    <files-path name="history_images" path="history_images/" />
+    <files-path name="saved_images" path="saved_images/" />
+    <files-path name="history_recordings" path="history_recordings/" />
+    <files-path name="saved_recordings" path="saved_recordings/" />
+    <external-files-path name="external_files" path="." />
+    <external-path name="legacy_external" path="." />
 </paths>

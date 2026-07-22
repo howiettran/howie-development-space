@@ -1,4 +1,4 @@
-Howie Translate v0.9.2 Durable Conversation Audio - Android source
+Howie Translate v0.10.0 Export, Accuracy and Original Image History - Android source
 
-Upload all files in this folder to the root of the existing GitHub repository.
-GitHub Actions will build Howie-Translate-v0.9.2-test.apk.
+Upload the contents of this folder to the root of the private GitHub repository and push to main.
+GitHub Actions will build Howie-Translate-v0.10.0-test.apk.

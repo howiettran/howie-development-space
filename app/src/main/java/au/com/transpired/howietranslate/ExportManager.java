@@ -18,7 +18,10 @@ import android.os.Looper;
 import android.provider.MediaStore;
 import android.provider.DocumentsContract;
 
+import androidx.core.content.FileProvider;
+
 import com.arthenica.ffmpegkit.FFmpegKit;
+import com.arthenica.ffmpegkit.FFmpegSession;
 import com.arthenica.ffmpegkit.ReturnCode;
 
 import java.io.BufferedWriter;
@@ -69,95 +72,153 @@ final class ExportManager {
     }
 
     void exportMp3(Models.RecordingItem item, Callback callback) {
-        File input = new File(item.path == null ? "" : item.path);
-        if (!input.exists()) {
-            error(callback, "The original audio file could not be found.");
-            return;
-        }
-        File workDir = createWorkDir("mp3");
-        File output = new File(workDir, "audio.mp3");
-        progress(callback, "Converting the recording to MP3…", 15);
-        String[] arguments = {
-                "-y", "-i", input.getAbsolutePath(), "-vn",
-                "-codec:a", "libmp3lame", "-b:a", "128k",
-                output.getAbsolutePath()
-        };
-        FFmpegKit.executeWithArgumentsAsync(arguments, session -> {
-            if (!ReturnCode.isSuccess(session.getReturnCode()) || !output.exists()) {
-                String detail = session.getAllLogsAsString();
-                deleteRecursively(workDir);
-                error(callback, "MP3 export failed." + shortDetail(detail));
-                return;
-            }
-            progress(callback, "Saving the MP3 to Downloads…", 88);
+        executor.execute(() -> {
+            File workDir = null;
             try {
+                File input = requireAudioInput(item);
+                workDir = createWorkDir("mp3");
+                File output = new File(workDir, "audio.mp3");
+                progress(callback, "Converting the recording to MP3…", 12);
+                String detail = encodeMp3WithFallback(input, output);
+                if (!validOutput(output)) {
+                    throw new IOException("The audio converter could not create a valid MP3." + shortDetail(detail));
+                }
+                progress(callback, "Saving the MP3 to your selected folder…", 88);
                 String name = safeFileName(item.title, "Howie Translate Recording") + ".mp3";
                 Uri uri = copyToDownloads(output, name, "audio/mpeg", true);
-                deleteRecursively(workDir);
                 success(callback, uri, name);
-            } catch (Exception e) {
+            } catch (Throwable failure) {
+                error(callback, exportFailureMessage("MP3", failure));
+            } finally {
                 deleteRecursively(workDir);
-                error(callback, "The MP3 was created but could not be saved: " + friendly(e));
             }
         });
     }
 
     void exportKaraokeMp4(Models.RecordingItem item, Callback callback) {
-        File input = new File(item.path == null ? "" : item.path);
-        if (!input.exists()) {
-            error(callback, "The original audio file could not be found.");
-            return;
-        }
         executor.execute(() -> {
-            File workDir = createWorkDir("karaoke");
+            File workDir = null;
             try {
+                File input = requireAudioInput(item);
+                workDir = createWorkDir("karaoke");
                 progress(callback, "Preparing numbered karaoke subtitles…", 5);
                 List<SubtitlePair> pairs = parsePairs(item);
                 if (pairs.isEmpty()) {
                     throw new IOException("No timestamped transcript lines are available for this recording.");
                 }
-                long totalMs = item.durationMs > 0 ? item.durationMs : Math.max(1000, pairs.get(pairs.size() - 1).startMs + 4000);
+                long totalMs = item.durationMs > 0 ? item.durationMs
+                        : Math.max(1000, pairs.get(pairs.size() - 1).startMs + 4000);
                 File framesDir = new File(workDir, "frames");
-                if (!framesDir.mkdirs() && !framesDir.isDirectory()) throw new IOException("Could not create the video frames folder.");
+                if (!framesDir.mkdirs() && !framesDir.isDirectory()) {
+                    throw new IOException("Could not create the video frames folder.");
+                }
                 File concat = new File(workDir, "frames.txt");
                 buildFrames(item, pairs, totalMs, framesDir, concat, callback);
 
                 File output = new File(workDir, "karaoke.mp4");
-                progress(callback, "Combining the highlighted text with the original audio…", 72);
+                progress(callback, "Combining the highlighted text with the original audio…", 74);
                 String[] arguments = {
-                        "-y",
+                        "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                         "-f", "concat", "-safe", "0", "-i", concat.getAbsolutePath(),
                         "-i", input.getAbsolutePath(),
                         "-map", "0:v:0", "-map", "1:a:0",
-                        "-c:v", "mpeg4", "-q:v", "3", "-pix_fmt", "yuv420p",
-                        "-fps_mode", "vfr",
+                        "-c:v", "mpeg4", "-q:v", "5", "-pix_fmt", "yuv420p", "-threads", "1",
+                        "-r", "12", "-fps_mode", "vfr",
                         "-c:a", "aac", "-b:a", "128k",
                         "-shortest", "-movflags", "+faststart",
                         output.getAbsolutePath()
                 };
-                FFmpegKit.executeWithArgumentsAsync(arguments, session -> {
-                    if (!ReturnCode.isSuccess(session.getReturnCode()) || !output.exists()) {
-                        String detail = session.getAllLogsAsString();
-                        deleteRecursively(workDir);
-                        error(callback, "Karaoke video export failed." + shortDetail(detail));
-                        return;
-                    }
-                    progress(callback, "Saving the karaoke video to Downloads…", 92);
-                    try {
-                        String name = safeFileName(item.title, "Howie Translate Karaoke") + " - Karaoke.mp4";
-                        Uri uri = copyToDownloads(output, name, "video/mp4", false);
-                        deleteRecursively(workDir);
-                        success(callback, uri, name);
-                    } catch (Exception e) {
-                        deleteRecursively(workDir);
-                        error(callback, "The video was created but could not be saved: " + friendly(e));
-                    }
-                });
-            } catch (Exception e) {
+                FFmpegSession session = FFmpegKit.executeWithArguments(arguments);
+                if (session == null || !ReturnCode.isSuccess(session.getReturnCode())
+                        || !validOutput(output)) {
+                    String detail = session == null ? "FFmpeg did not start." : session.getAllLogsAsString();
+                    throw new IOException("The video converter could not create a valid MP4." + shortDetail(detail));
+                }
+                progress(callback, "Saving the karaoke video to your selected folder…", 93);
+                String name = safeFileName(item.title, "Howie Translate Karaoke") + " - Karaoke.mp4";
+                Uri uri = copyToDownloads(output, name, "video/mp4", false);
+                success(callback, uri, name);
+            } catch (Throwable failure) {
+                error(callback, exportFailureMessage("Karaoke MP4", failure));
+            } finally {
                 deleteRecursively(workDir);
-                error(callback, "Karaoke video export failed: " + friendly(e));
             }
         });
+    }
+
+
+    /**
+     * Uses the bundled LAME encoder first and falls back to Shine on devices where LAME cannot be
+     * initialised. Both calls stay on the dedicated export worker so an encoder failure is reported
+     * to the screen instead of taking down the activity.
+     */
+    private String encodeMp3WithFallback(File input, File output) {
+        String lower = input.getName().toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".mp3")) {
+            try (InputStream in = new FileInputStream(input);
+                 OutputStream out = new FileOutputStream(output)) {
+                copy(in, out);
+                return "The source recording was already MP3.";
+            } catch (IOException e) {
+                return friendly(e);
+            }
+        }
+
+        StringBuilder logs = new StringBuilder();
+        String[][] encoders = {
+                {"libmp3lame", "128k"},
+                {"libshine", "128k"}
+        };
+        for (String[] encoder : encoders) {
+            if (output.exists()) output.delete();
+            String[] arguments = {
+                    "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                    "-i", input.getAbsolutePath(),
+                    "-map", "0:a:0", "-vn", "-sn", "-dn",
+                    "-ac", "1", "-ar", "44100",
+                    "-codec:a", encoder[0], "-b:a", encoder[1],
+                    "-f", "mp3", output.getAbsolutePath()
+            };
+            try {
+                FFmpegSession session = FFmpegKit.executeWithArguments(arguments);
+                if (session != null && session.getAllLogsAsString() != null) {
+                    logs.append(encoder[0]).append(": ").append(session.getAllLogsAsString()).append('\n');
+                }
+                if (session != null && ReturnCode.isSuccess(session.getReturnCode()) && validOutput(output)) {
+                    return logs.toString();
+                }
+            } catch (Throwable failure) {
+                logs.append(encoder[0]).append(": ").append(friendly(failure)).append('\n');
+            }
+        }
+        return logs.toString();
+    }
+
+    private File requireAudioInput(Models.RecordingItem item) throws IOException {
+        if (item == null || item.path == null || item.path.trim().isEmpty()) {
+            throw new IOException("The original audio file is not linked to this conversation.");
+        }
+        File input = new File(item.path);
+        if (!input.isFile() || input.length() <= 1024L) {
+            throw new IOException("The original audio file could not be found or is incomplete.");
+        }
+        return input;
+    }
+
+    private boolean validOutput(File output) {
+        return output != null && output.isFile() && output.length() > 1024L;
+    }
+
+    private String exportFailureMessage(String type, Throwable failure) {
+        if (failure instanceof OutOfMemoryError) {
+            return type + " export ran out of memory. Close other apps and try a shorter conversation.";
+        }
+        if (failure instanceof UnsatisfiedLinkError || failure instanceof NoClassDefFoundError) {
+            return type + " export could not start because the bundled media converter did not load on this phone."
+                    + " Reinstall the latest APK and try again.";
+        }
+        String detail = friendly(failure);
+        return type + " export failed safely without closing the app. " + detail;
     }
 
     private void buildFrames(Models.RecordingItem item, List<SubtitlePair> pairs, long totalMs,
@@ -173,14 +234,14 @@ final class ExportManager {
             long phraseDuration = Math.max(400, end - pair.startMs);
             List<String> tokens = tokenize(pair.original, item.sourceLanguage);
             if (tokens.isEmpty()) tokens = Collections.singletonList(pair.original);
-            int maxSteps = Math.max(1, (int) (phraseDuration / 90));
+            int maxSteps = Math.max(1, Math.min(12, (int) (phraseDuration / 280)));
             int groupSize = Math.max(1, (int) Math.ceil(tokens.size() / (double) maxSteps));
             int steps = (int) Math.ceil(tokens.size() / (double) groupSize);
-            long baseDuration = Math.max(55, phraseDuration / Math.max(1, steps));
+            long baseDuration = Math.max(180, phraseDuration / Math.max(1, steps));
             long used = 0;
             for (int step = 0; step < steps; step++) {
                 int highlightTo = Math.min(tokens.size() - 1, ((step + 1) * groupSize) - 1);
-                long duration = step == steps - 1 ? Math.max(55, phraseDuration - used) : baseDuration;
+                long duration = step == steps - 1 ? Math.max(180, phraseDuration - used) : baseDuration;
                 used += duration;
                 specs.add(new FrameSpec(pair, highlightTo, duration));
             }
@@ -191,7 +252,7 @@ final class ExportManager {
         try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(concat), StandardCharsets.UTF_8))) {
             for (int i = 0; i < specs.size(); i++) {
                 FrameSpec spec = specs.get(i);
-                File image = new File(framesDir, String.format(Locale.US, "frame_%05d.png", i));
+                File image = new File(framesDir, String.format(Locale.US, "frame_%05d.jpg", i));
                 renderFrame(image, item, spec, logo, totalMs);
                 writer.write("file '");
                 writer.write(image.getAbsolutePath().replace("'", "'\\''"));
@@ -202,7 +263,7 @@ final class ExportManager {
                     progress(callback, "Creating karaoke frame " + (i + 1) + " of " + specs.size() + "…", percent);
                 }
             }
-            File last = new File(framesDir, String.format(Locale.US, "frame_%05d.png", specs.size() - 1));
+            File last = new File(framesDir, String.format(Locale.US, "frame_%05d.jpg", specs.size() - 1));
             writer.write("file '");
             writer.write(last.getAbsolutePath().replace("'", "'\\''"));
             writer.write("'\n");
@@ -211,8 +272,8 @@ final class ExportManager {
     }
 
     private void renderFrame(File output, Models.RecordingItem item, FrameSpec spec, Bitmap logo, long totalMs) throws IOException {
-        final int width = 1280;
-        final int height = 720;
+        final int width = 960;
+        final int height = 540;
         Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
         Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
@@ -279,7 +340,7 @@ final class ExportManager {
         canvas.drawRoundRect(new RectF(84, 657, 84 + (width - 168) * progress, 674), 9, 9, paint);
 
         try (FileOutputStream stream = new FileOutputStream(output)) {
-            if (!bitmap.compress(Bitmap.CompressFormat.PNG, 92, stream)) throw new IOException("Could not encode a karaoke frame.");
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 88, stream)) throw new IOException("Could not encode a karaoke frame.");
         } finally {
             bitmap.recycle();
         }
@@ -448,7 +509,7 @@ final class ExportManager {
         try (InputStream input = new FileInputStream(source); OutputStream output = new FileOutputStream(target)) {
             copy(input, output);
         }
-        return Uri.fromFile(target);
+        return FileProvider.getUriForFile(context, context.getPackageName() + ".fileprovider", target);
     }
 
     private File uniqueFile(File folder, String displayName) {
@@ -505,9 +566,9 @@ final class ExportManager {
         return LanguageSupport.displayName(code);
     }
 
-    private String friendly(Exception e) {
-        String message = e.getMessage();
-        return message == null || message.trim().isEmpty() ? e.getClass().getSimpleName() : message;
+    private String friendly(Throwable e) {
+        String message = e == null ? "" : e.getMessage();
+        return message == null || message.trim().isEmpty() ? (e == null ? "Unknown error" : e.getClass().getSimpleName()) : message;
     }
 
     private String shortDetail(String logs) {
