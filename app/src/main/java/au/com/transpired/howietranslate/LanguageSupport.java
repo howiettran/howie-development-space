@@ -101,7 +101,7 @@ final class LanguageSupport {
     }
 
     static String[] downloadableTranslationCodes() {
-        Set<String> unique = new LinkedHashSet<>(Arrays.asList("en", "zh", "vi", "th", "ms"));
+        Set<String> unique = new LinkedHashSet<>(Arrays.asList("zh", "vi", "th", "ms"));
         return unique.toArray(new String[0]);
     }
 

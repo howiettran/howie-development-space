@@ -189,6 +189,7 @@ public class MainActivity extends Activity {
     private long liveSessionToken;
     private final Handler liveControlHandler = new Handler(Looper.getMainLooper());
     private Runnable liveStopWatchdog;
+    private Runnable livePrepareWatchdog;
 
     private final Runnable recordingTicker = new Runnable() {
         @Override public void run() {
@@ -242,6 +243,7 @@ public class MainActivity extends Activity {
         if (googleOnlineSpeechManager != null) googleOnlineSpeechManager.close();
         if (streamingSpeechManager != null) streamingSpeechManager.close();
         if (exportManager != null) exportManager.close();
+        cancelLivePreparationWatchdog();
         storageExecutor.shutdownNow();
         if (offlineSpeechManager != null) offlineSpeechManager.close();
         translationManager.close();
@@ -1033,8 +1035,8 @@ public class MainActivity extends Activity {
         page.addView(storageCard, marginTop(matchWrap(), 10));
 
         LinearLayout about = cardTint(Color.rgb(255, 244, 246));
-        about.addView(text("Howie Translate 0.10.0 export, accuracy and image-history build", 17, RED, true));
-        about.addView(text("Rebuilds MP3/MP4 export so failures no longer close the app, protects user glossary terms during translation, and retains each original OCR image through History and Saved with a selectable image folder.", 14, TEXT, false), marginTop(matchWrap(), 6));
+        about.addView(text("Howie Translate 0.10.1 translation startup fix build", 17, RED, true));
+        about.addView(text("Fixes Translate and Start Live model preparation, prevents the interface from remaining stuck in Preparing mode, and keeps the v0.10.0 export, glossary and original-image improvements.", 14, TEXT, false), marginTop(matchWrap(), 6));
         page.addView(about, marginTop(matchWrap(), 10));
 
         download.setOnClickListener(v -> {
@@ -1156,7 +1158,7 @@ public class MainActivity extends Activity {
     private void doTranslation(String source, String target, String input, TextView result, TextView pinyin,
                                TextView status, ProgressBar progress) {
         if (progress != null) progress.setVisibility(View.VISIBLE);
-        status.setText("Preparing…");
+        status.setText("Checking the selected translation model…");
         translationManager.translate(source, target, input, new TranslationManager.Callback() {
             @Override public void onStatus(String message) { runOnUiThread(() -> status.setText(message)); }
             @Override public void onSuccess(String translatedText) { runOnUiThread(() -> {
@@ -1276,6 +1278,7 @@ public class MainActivity extends Activity {
         }
         liveLanguageA = source;
         liveLanguageB = target;
+        armLivePreparationWatchdog(token);
         boolean useGoogle = conversationEngine == null || conversationEngine.getSelectedItemPosition() == 0;
         activeGoogleOnlineEngine = useGoogle;
 
@@ -1370,7 +1373,7 @@ public class MainActivity extends Activity {
 
     private void prepareLiveTranslationAndStart(String source, String target, long token) {
         if (token != liveSessionToken || liveControlState != LiveControlState.PREPARING) return;
-        if (conversationStatus != null) conversationStatus.setText("Preparing offline translation models…");
+        if (conversationStatus != null) conversationStatus.setText("Checking the selected translation model. If it is not installed, the app will download it now…");
         translationManager.preparePair(source, target, new TranslationManager.PreparationCallback() {
             @Override public void onProgress(String message) {
                 runOnUiThread(() -> {
@@ -1404,6 +1407,7 @@ public class MainActivity extends Activity {
 
     private void beginLiveConversation(String source, String target, long token) {
         if (token != liveSessionToken || liveControlState != LiveControlState.PREPARING) return;
+        cancelLivePreparationWatchdog();
         if (currentRecordingFile != null && currentRecordingFile.exists() && currentHistoryId == 0) currentRecordingFile.delete();
         currentHistoryId = 0;
         File dir = new File(getFilesDir(), "recordings");
@@ -1744,7 +1748,31 @@ public class MainActivity extends Activity {
         maybeEnableLiveSave();
     }
 
+    private void armLivePreparationWatchdog(long token) {
+        cancelLivePreparationWatchdog();
+        livePrepareWatchdog = () -> {
+            if (token != liveSessionToken || liveControlState != LiveControlState.PREPARING) return;
+            resetLiveControlsToIdle("Start Live could not finish preparing the translation model.");
+            new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("Start Live preparation stopped")
+                    .setMessage("The translation model did not become ready. Check the internet connection and Google Play Services, then try again. The Start Live button has been reset so the app is not left stuck in Preparing mode.")
+                    .setPositiveButton("OK", null)
+                    .show();
+        };
+        // Slightly longer than TranslationManager's model timeout, so its more specific error is
+        // normally shown first. This is a final UI safety net if an Android task never returns.
+        liveControlHandler.postDelayed(livePrepareWatchdog, 190000L);
+    }
+
+    private void cancelLivePreparationWatchdog() {
+        if (livePrepareWatchdog != null) {
+            liveControlHandler.removeCallbacks(livePrepareWatchdog);
+            livePrepareWatchdog = null;
+        }
+    }
+
     private void resetLiveControlsToIdle(String message) {
+        cancelLivePreparationWatchdog();
         liveControlState = LiveControlState.IDLE;
         isRecording = false;
         liveConversationActive = false;

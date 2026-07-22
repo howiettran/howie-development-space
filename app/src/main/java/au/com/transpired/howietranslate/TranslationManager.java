@@ -13,10 +13,14 @@ import com.google.mlkit.nl.translate.TranslatorOptions;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,11 +38,15 @@ final class TranslationManager {
         void onError(String message);
     }
 
-    private static final long QUICK_MODEL_TIMEOUT_MS = 30000L;
-    private static final long TRANSLATE_TIMEOUT_MS = 20000L;
-    private static final long SETTINGS_MODEL_TIMEOUT_MS = 180000L;
+    // Translation models are about 30 MB each. A 30-second timeout was too short on slower
+    // mobile connections and left the UI appearing permanently stuck when the ML Kit task did
+    // not return. Every model operation now has a visible status and a hard upper limit.
+    private static final long PAIR_MODEL_TIMEOUT_MS = 180000L;
+    private static final long TRANSLATE_TIMEOUT_MS = 30000L;
+    private static final long SETTINGS_MODEL_TIMEOUT_MS = 240000L;
 
     private final Map<String, Translator> cache = new HashMap<>();
+    private final Set<String> readyPairs = Collections.synchronizedSet(new HashSet<>());
     private final RemoteModelManager modelManager = RemoteModelManager.getInstance();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AppDatabase database;
@@ -70,28 +78,27 @@ final class TranslationManager {
             return;
         }
 
-        Translator translator = getTranslator(sourceMl, targetMl);
-        callback.onStatus("Checking " + LanguageSupport.displayName(source) + " and "
-                + LanguageSupport.displayName(target) + " offline models...");
-        AtomicBoolean finished = new AtomicBoolean(false);
-        Runnable timeout = () -> {
-            if (finished.compareAndSet(false, true)) {
-                callback.onError("The language models are taking too long to prepare. Open Settings, download the translation models, then try again.");
-            }
-        };
-        mainHandler.postDelayed(timeout, QUICK_MODEL_TIMEOUT_MS);
+        String pair = pairKey(sourceMl, targetMl);
+        if (readyPairs.contains(pair)) {
+            translatePreparedInternal(getTranslator(sourceMl, targetMl), source, target, cleanText, callback);
+            return;
+        }
 
-        translator.downloadModelIfNeeded(new DownloadConditions.Builder().build())
-                .addOnSuccessListener(unused -> {
-                    if (!finished.compareAndSet(false, true)) return;
-                    mainHandler.removeCallbacks(timeout);
-                    translatePreparedInternal(translator, source, target, cleanText, callback);
-                })
-                .addOnFailureListener(error -> {
-                    if (!finished.compareAndSet(false, true)) return;
-                    mainHandler.removeCallbacks(timeout);
-                    callback.onError(modelFailureMessage(source, target, error));
-                });
+        ensurePairModels(source, target, new PreparationCallback() {
+            @Override public void onProgress(String message) {
+                callback.onStatus(message);
+            }
+
+            @Override public void onComplete() {
+                readyPairs.add(pair);
+                translatePreparedInternal(getTranslator(sourceMl, targetMl), source, target, cleanText, callback);
+            }
+
+            @Override public void onError(String message) {
+                readyPairs.remove(pair);
+                callback.onError(message);
+            }
+        });
     }
 
     void preparePair(String source, String target, PreparationCallback callback) {
@@ -110,27 +117,28 @@ final class TranslationManager {
             return;
         }
 
-        callback.onProgress("Preparing " + LanguageSupport.displayName(source) + " and "
-                + LanguageSupport.displayName(target) + " offline translation...");
-        Translator translator = getTranslator(sourceMl, targetMl);
-        AtomicBoolean finished = new AtomicBoolean(false);
-        Runnable timeout = () -> {
-            if (finished.compareAndSet(false, true)) {
-                callback.onError("Translation model preparation timed out. Download the models from Settings and try again.");
+        String pair = pairKey(sourceMl, targetMl);
+        if (readyPairs.contains(pair)) {
+            callback.onProgress("Translation models are ready.");
+            callback.onComplete();
+            return;
+        }
+
+        ensurePairModels(source, target, new PreparationCallback() {
+            @Override public void onProgress(String message) {
+                callback.onProgress(message);
             }
-        };
-        mainHandler.postDelayed(timeout, QUICK_MODEL_TIMEOUT_MS);
-        translator.downloadModelIfNeeded(new DownloadConditions.Builder().build())
-                .addOnSuccessListener(unused -> {
-                    if (!finished.compareAndSet(false, true)) return;
-                    mainHandler.removeCallbacks(timeout);
-                    callback.onComplete();
-                })
-                .addOnFailureListener(error -> {
-                    if (!finished.compareAndSet(false, true)) return;
-                    mainHandler.removeCallbacks(timeout);
-                    callback.onError(modelFailureMessage(source, target, error));
-                });
+
+            @Override public void onComplete() {
+                readyPairs.add(pair);
+                callback.onComplete();
+            }
+
+            @Override public void onError(String message) {
+                readyPairs.remove(pair);
+                callback.onError(message);
+            }
+        });
     }
 
     void translatePrepared(String source, String target, String text, Callback callback) {
@@ -153,6 +161,15 @@ final class TranslationManager {
             callback.onSuccess(cleanText);
             return;
         }
+
+        String pair = pairKey(sourceMl, targetMl);
+        if (!readyPairs.contains(pair)) {
+            // A live session should normally prepare its pair before listening starts. If Android
+            // cleared a model or the preparation callback was interrupted, recover instead of
+            // silently dropping every live phrase.
+            translate(source, target, cleanText, callback);
+            return;
+        }
         translatePreparedInternal(getTranslator(sourceMl, targetMl), source, target, cleanText, callback);
     }
 
@@ -164,6 +181,7 @@ final class TranslationManager {
     void close() {
         for (Translator translator : cache.values()) translator.close();
         cache.clear();
+        readyPairs.clear();
     }
 
     private void translatePreparedInternal(Translator translator, String source, String target,
@@ -188,6 +206,7 @@ final class TranslationManager {
                 .addOnFailureListener(error -> {
                     if (!finished.compareAndSet(false, true)) return;
                     mainHandler.removeCallbacks(timeout);
+                    readyPairs.remove(pairKey(mlCode(source), mlCode(target)));
                     callback.onError("Translation could not be completed. " + readable(error));
                 });
     }
@@ -289,64 +308,118 @@ final class TranslationManager {
         }
     }
 
+    /**
+     * Ensures only the non-English models for a selected pair. English is built into ML Kit and
+     * must not be passed to TranslateRemoteModel.Builder; older builds attempted to download it,
+     * which caused the Settings model task to fail and left Translate/Start Live waiting.
+     */
+    private void ensurePairModels(String source, String target, PreparationCallback callback) {
+        String sourceMl = mlCode(source);
+        String targetMl = mlCode(target);
+        LinkedHashSet<String> required = new LinkedHashSet<>();
+        if (sourceMl != null && !isBuiltInEnglish(sourceMl)) required.add(sourceMl);
+        if (targetMl != null && !isBuiltInEnglish(targetMl)) required.add(targetMl);
+        if (required.isEmpty()) {
+            callback.onProgress("Translation models are ready.");
+            callback.onComplete();
+            return;
+        }
+        List<String> models = new ArrayList<>(required);
+        ensureModelsSequentially(models, 0, source, target, callback);
+    }
+
+    private void ensureModelsSequentially(List<String> models, int index, String source,
+                                          String target, PreparationCallback callback) {
+        if (index >= models.size()) {
+            callback.onProgress("Translation models are ready.");
+            callback.onComplete();
+            return;
+        }
+        String mlLanguage = models.get(index);
+        String display = displayNameForMlCode(mlLanguage);
+        callback.onProgress("Preparing " + display + " translation model ("
+                + (index + 1) + " of " + models.size() + ")…");
+
+        TranslateRemoteModel model = new TranslateRemoteModel.Builder(mlLanguage).build();
+        AtomicBoolean finished = new AtomicBoolean(false);
+        Runnable timeout = () -> {
+            if (finished.compareAndSet(false, true)) {
+                callback.onError(display + " translation model preparation timed out. "
+                        + "Check the internet connection, Google Play Services and free storage, then try again.");
+            }
+        };
+        mainHandler.postDelayed(timeout, PAIR_MODEL_TIMEOUT_MS);
+
+        // RemoteModelManager.download() is safe for an already-installed model: it completes
+        // immediately when no update is needed. Calling it directly avoids an isModelDownloaded
+        // task becoming a second point where the screen can wait forever.
+        modelManager.download(model, new DownloadConditions.Builder().build())
+                .addOnSuccessListener(unused -> {
+                    if (!finished.compareAndSet(false, true)) return;
+                    mainHandler.removeCallbacks(timeout);
+                    callback.onProgress(display + " translation model is ready.");
+                    ensureModelsSequentially(models, index + 1, source, target, callback);
+                })
+                .addOnFailureListener(error -> {
+                    if (!finished.compareAndSet(false, true)) return;
+                    mainHandler.removeCallbacks(timeout);
+                    callback.onError(modelFailureMessage(source, target, error));
+                });
+    }
+
     private void downloadModelSequentially(String[] models, int index, PreparationCallback callback) {
         if (index >= models.length) {
             callback.onComplete();
             return;
         }
         String code = models[index];
-        String mlCode = mlCode(code);
-        if (mlCode == null) {
+        String mlLanguage = mlCode(code);
+        if (mlLanguage == null || isBuiltInEnglish(mlLanguage)) {
             downloadModelSequentially(models, index + 1, callback);
             return;
         }
         int number = index + 1;
-        callback.onProgress("Model " + number + " of " + models.length + ": checking "
-                + LanguageSupport.displayName(code) + "...");
-        TranslateRemoteModel model = new TranslateRemoteModel.Builder(mlCode).build();
+        String display = LanguageSupport.displayName(code);
+        callback.onProgress("Model " + number + " of " + models.length + ": preparing " + display + "…");
+        TranslateRemoteModel model = new TranslateRemoteModel.Builder(mlLanguage).build();
         AtomicBoolean finished = new AtomicBoolean(false);
         Runnable timeout = () -> {
             if (finished.compareAndSet(false, true)) {
-                callback.onError(LanguageSupport.displayName(code)
-                        + " model download timed out. Check the internet connection, Google Play Services and available storage, then retry.");
+                callback.onError(display + " model download timed out. Check the internet connection, "
+                        + "Google Play Services and available storage, then retry.");
             }
         };
         mainHandler.postDelayed(timeout, SETTINGS_MODEL_TIMEOUT_MS);
 
-        modelManager.isModelDownloaded(model)
-                .addOnSuccessListener(installed -> {
-                    if (finished.get()) return;
-                    if (Boolean.TRUE.equals(installed)) {
-                        if (!finished.compareAndSet(false, true)) return;
-                        mainHandler.removeCallbacks(timeout);
-                        callback.onProgress("Model " + number + " of " + models.length + ": "
-                                + LanguageSupport.displayName(code) + " is already installed.");
-                        downloadModelSequentially(models, index + 1, callback);
-                        return;
-                    }
-                    callback.onProgress("Model " + number + " of " + models.length + ": downloading "
-                            + LanguageSupport.displayName(code) + "...");
-                    modelManager.download(model, new DownloadConditions.Builder().build())
-                            .addOnSuccessListener(unused -> {
-                                if (!finished.compareAndSet(false, true)) return;
-                                mainHandler.removeCallbacks(timeout);
-                                callback.onProgress("Model " + number + " of " + models.length + ": "
-                                        + LanguageSupport.displayName(code) + " installed.");
-                                downloadModelSequentially(models, index + 1, callback);
-                            })
-                            .addOnFailureListener(error -> {
-                                if (!finished.compareAndSet(false, true)) return;
-                                mainHandler.removeCallbacks(timeout);
-                                callback.onError(LanguageSupport.displayName(code)
-                                        + " model could not be downloaded. " + readable(error));
-                            });
+        modelManager.download(model, new DownloadConditions.Builder().build())
+                .addOnSuccessListener(unused -> {
+                    if (!finished.compareAndSet(false, true)) return;
+                    mainHandler.removeCallbacks(timeout);
+                    callback.onProgress("Model " + number + " of " + models.length + ": "
+                            + display + " is ready.");
+                    downloadModelSequentially(models, index + 1, callback);
                 })
                 .addOnFailureListener(error -> {
                     if (!finished.compareAndSet(false, true)) return;
                     mainHandler.removeCallbacks(timeout);
-                    callback.onError("The app could not check the " + LanguageSupport.displayName(code)
-                            + " model. " + readable(error));
+                    callback.onError(display + " model could not be downloaded. " + readable(error));
                 });
+    }
+
+    private boolean isBuiltInEnglish(String mlLanguage) {
+        return TranslateLanguage.ENGLISH.equals(mlLanguage);
+    }
+
+    private String pairKey(String sourceMl, String targetMl) {
+        return (sourceMl == null ? "" : sourceMl) + ">" + (targetMl == null ? "" : targetMl);
+    }
+
+    private String displayNameForMlCode(String mlLanguage) {
+        if (TranslateLanguage.CHINESE.equals(mlLanguage)) return "Chinese";
+        if (TranslateLanguage.VIETNAMESE.equals(mlLanguage)) return "Vietnamese";
+        if (TranslateLanguage.THAI.equals(mlLanguage)) return "Thai";
+        if (TranslateLanguage.MALAY.equals(mlLanguage)) return "Malay";
+        return "selected";
     }
 
     private Translator getTranslator(String source, String target) {
@@ -376,8 +449,8 @@ final class TranslationManager {
     private String modelFailureMessage(String source, String target, Exception error) {
         return "The " + LanguageSupport.displayName(source) + " and "
                 + LanguageSupport.displayName(target)
-                + " models are not ready. Open Settings and tap Download all translation models. "
-                + readable(error);
+                + " translation model could not be prepared. Check that this phone is online, "
+                + "Google Play Services is enabled and there is enough free storage. " + readable(error);
     }
 
     private String readable(Exception error) {
