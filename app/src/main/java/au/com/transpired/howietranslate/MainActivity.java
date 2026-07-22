@@ -72,6 +72,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 
 public class MainActivity extends Activity {
     private static final String HISTORY_ONLY_MARKER = AppDatabase.HISTORY_ONLY_MARKER;
@@ -204,6 +206,7 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         db = new AppDatabase(this);
+        repairAudioLinks();
         translationManager = new TranslationManager();
         offlineSpeechManager = new OfflineSpeechManager(this);
         streamingSpeechManager = new StreamingSpeechManager(this, offlineSpeechManager);
@@ -645,6 +648,7 @@ public class MainActivity extends Activity {
         }
         String lastCategory = null;
         for (Models.RecordingItem item : items) {
+            repairAnyAudioIfPossible(item);
             if (!item.category.equalsIgnoreCase(lastCategory == null ? "" : lastCategory)) {
                 TextView heading = text(item.category, 15, DARK_BLUE, true);
                 list.addView(heading, marginTop(matchWrap(), lastCategory == null ? 0 : 14));
@@ -732,6 +736,7 @@ public class MainActivity extends Activity {
 
         int position = 1;
         for (Models.RecordingItem item : items) {
+            repairHistoryAudioIfPossible(item, item.id == currentHistoryId ? currentRecordingFile : null);
             LinearLayout recordCard = card();
             LinearLayout top = horizontal();
             TextView title = text(chronologicalNumbers.get(item.id) + ".  " + item.title, 18, TEXT, true);
@@ -752,9 +757,12 @@ public class MainActivity extends Activity {
             LinearLayout actions = horizontal();
             Button open = button("Open", true);
             Button retranslate = button("Translate", false);
-            boolean alreadySaved = db.hasSavedCopyForSource(item.id);
-            Button saveItem = button(alreadySaved ? "Saved ✓" : "Save", false);
-            saveItem.setEnabled(!alreadySaved);
+            Models.RecordingItem savedCopy = db.getSavedCopyForSource(item.id);
+            boolean alreadySaved = savedCopy != null;
+            boolean savedNeedsAudioRepair = alreadySaved && historyHasAudio && !validAudioPath(savedCopy.path);
+            Button saveItem = button(savedNeedsAudioRepair ? "Repair Saved Audio"
+                    : (alreadySaved ? "Saved ✓" : "Save"), false);
+            saveItem.setEnabled(!alreadySaved || savedNeedsAudioRepair);
             actions.addView(open, new LinearLayout.LayoutParams(0, dp(45), 1));
             LinearLayout.LayoutParams translateLp = new LinearLayout.LayoutParams(0, dp(45), 1);
             translateLp.setMargins(dp(6), 0, dp(6), 0);
@@ -974,7 +982,7 @@ public class MainActivity extends Activity {
         page.addView(storageCard, marginTop(matchWrap(), 10));
 
         LinearLayout about = cardTint(Color.rgb(255, 244, 246));
-        about.addView(text("Howie Translate 0.9.1 Saved audio reliability build", 17, RED, true));
+        about.addView(text("Howie Translate 0.9.2 durable conversation audio build", 17, RED, true));
         about.addView(text("Adds Thai, Malay, Cantonese and Teo Chew selections; sequential translation-model downloads; model and translation timeouts; Chinese-script OCR; and editable OCR review. Cantonese and Teo Chew are best-effort dialect modes that use Chinese writing models.", 14, TEXT, false), marginTop(matchWrap(), 6));
         page.addView(about, marginTop(matchWrap(), 10));
 
@@ -1538,22 +1546,27 @@ public class MainActivity extends Activity {
     }
 
     private void maybeEnableLiveSave() {
-        if (!liveAudioStopped || liveTranslationBusy || !liveTranslationQueue.isEmpty()) return;
+        if (!liveAudioStopped) return;
+        // Saving must not depend on translation completion. Earlier builds left this button
+        // disabled whenever a queued translation stalled, even though the audio had already
+        // finished and was safe to retain.
         autoSaveLiveHistory();
-        boolean hasAudio = currentRecordingFile != null && currentRecordingFile.isFile()
-                && currentRecordingFile.length() > 1024L;
+        boolean hasAudio = validAudioFile(currentRecordingFile);
         boolean ready = hasCurrentConversationContent() && !currentConversationSaved;
         if (saveRecordingButton != null) {
             saveRecordingButton.setEnabled(ready);
             saveRecordingButton.setText(currentConversationSaved ? "Saved ✓" : "Save to Saved");
         }
         if (conversationStatus != null) {
+            boolean translationsPending = liveTranslationBusy || !liveTranslationQueue.isEmpty();
             if (currentConversationSaved) {
-                conversationStatus.setText("Saved. History keeps its own conversation and audio link.");
+                conversationStatus.setText("Saved. History and Saved each keep a durable audio link.");
+            } else if (hasAudio && translationsPending) {
+                conversationStatus.setText("Audio is safely stored in History. You can save it now while the last translation finishes.");
             } else if (hasAudio) {
                 conversationStatus.setText("Saved automatically to History. Tap Save to Saved to create a separate protected copy with audio.");
             } else {
-                conversationStatus.setText("Saved automatically to History. You can save the transcript now, or use Offline Whisper next time to guarantee a reusable audio file.");
+                conversationStatus.setText("Saved automatically to History without reusable audio. Choose Offline Whisper when the recording must be retained.");
             }
         }
     }
@@ -1643,11 +1656,21 @@ public class MainActivity extends Activity {
             liveStopWatchdog = null;
         }
         pendingDurationMs = Math.max(0, durationMs);
-        if (activeGoogleOnlineEngine) {
-            currentRecordingFile = audioFile != null && audioFile.isFile() && audioFile.length() > 1024L
-                    ? audioFile : null;
-        } else if (audioFile != null && audioFile.isFile()) {
+        if (validAudioFile(audioFile)) {
             currentRecordingFile = audioFile;
+        } else if (!validAudioFile(currentRecordingFile)) {
+            currentRecordingFile = null;
+        }
+        if (validAudioFile(currentRecordingFile) && currentHistoryId > 0) {
+            try {
+                currentRecordingFile = promoteAudioToHistoryStorage(currentRecordingFile, currentHistoryId);
+            } catch (IOException e) {
+                // Keep the original valid file rather than losing the recording because the
+                // promotion copy failed. persistLiveHistory() will retain this path.
+                if (conversationStatus != null) {
+                    conversationStatus.setText("The recording was retained, but could not be moved into protected History storage yet.");
+                }
+            }
         }
         isRecording = false;
         liveConversationActive = false;
@@ -1731,6 +1754,11 @@ public class MainActivity extends Activity {
     }
 
     private void savePendingRecording() {
+        if (isRecording || liveControlState == LiveControlState.RECORDING
+                || liveControlState == LiveControlState.STOPPING) {
+            toast("Stop the live conversation before saving it.");
+            return;
+        }
         if (!hasCurrentConversationContent()) {
             toast("There is no conversation to save yet.");
             return;
@@ -1738,31 +1766,49 @@ public class MainActivity extends Activity {
         persistLiveHistory(currentHistoryId == 0);
         Models.RecordingItem historyItem = findCurrentHistoryItem();
         if (historyItem == null) {
-            toast("The History conversation could not be found. Please stop the conversation and try again.");
+            toast("The History conversation could not be found. Please start a new conversation and try again.");
             return;
         }
+        historyItem = repairHistoryAudioIfPossible(historyItem, currentRecordingFile);
         Models.RecordingItem saved = createSavedCopy(historyItem, true);
         if (saved == null) return;
         currentConversationSaved = true;
-        recordingTimer.setText("Saved  " + formatDuration(historyItem.durationMs));
-        conversationStatus.setText(saved.path == null || saved.path.isEmpty()
-                ? "Conversation saved. No reusable audio file was available, so the transcript was saved without audio."
-                : "Conversation and audio saved. History keeps its original audio link.");
-        saveRecordingButton.setText("Saved ✓");
-        saveRecordingButton.setEnabled(false);
+        if (recordingTimer != null) recordingTimer.setText("Saved  " + formatDuration(historyItem.durationMs));
+        if (conversationStatus != null) conversationStatus.setText(validAudioPath(saved.path)
+                ? "Conversation and audio saved. History and Saved now have separate protected audio files."
+                : "Conversation saved, but this session did not contain a reusable audio recording.");
+        if (saveRecordingButton != null) {
+            saveRecordingButton.setText("Saved ✓");
+            saveRecordingButton.setEnabled(false);
+        }
         persistentPages.remove("saved");
-        persistentPages.remove("history");
-        toast(saved.path == null || saved.path.isEmpty()
-                ? "Conversation saved without audio."
-                : "Conversation and audio saved.");
+        toast(validAudioPath(saved.path)
+                ? "Conversation and audio saved."
+                : "Conversation saved without audio.");
     }
 
     private Models.RecordingItem createSavedCopy(Models.RecordingItem source, boolean showErrors) {
         if (source == null) return null;
-        if (db.hasSavedCopyForSource(source.id)) {
-            if (showErrors) toast("This conversation is already in Saved.");
-            return db.getSavedCopyForSource(source.id);
+        source = repairHistoryAudioIfPossible(source,
+                source.id == currentHistoryId ? currentRecordingFile : null);
+        File sourceAudio = resolveAudioFile(source);
+
+        Models.RecordingItem existingSaved = db.getSavedCopyForSource(source.id);
+        if (existingSaved != null) {
+            // Repair an older transcript-only Saved row when its History audio still exists.
+            if (!validAudioPath(existingSaved.path) && sourceAudio != null) {
+                try {
+                    existingSaved.path = copyAudioToSavedStorage(sourceAudio, source.id);
+                    existingSaved.durationMs = Math.max(existingSaved.durationMs, source.durationMs);
+                    db.updateRecording(existingSaved);
+                } catch (IOException e) {
+                    if (showErrors) showAudioSaveError(e);
+                    return null;
+                }
+            }
+            return existingSaved;
         }
+
         Models.RecordingItem saved = new Models.RecordingItem();
         saved.title = source.title;
         saved.category = source.category;
@@ -1776,20 +1822,11 @@ public class MainActivity extends Activity {
         saved.sortOrder = 0;
         saved.notes = cleanSavedNotes(source.notes, source.id);
 
-        File sourceAudio = source.path == null || source.path.trim().isEmpty()
-                ? null : new File(source.path);
-        if (sourceAudio != null && sourceAudio.isFile() && sourceAudio.length() > 1024L) {
+        if (sourceAudio != null) {
             try {
                 saved.path = copyAudioToSavedStorage(sourceAudio, source.id);
             } catch (IOException e) {
-                if (showErrors) {
-                    new AlertDialog.Builder(this)
-                            .setTitle("Audio could not be saved")
-                            .setMessage("The conversation is still safe in History, but its audio could not be copied to Saved. "
-                                    + (e.getMessage() == null ? "Please try again." : e.getMessage()))
-                            .setPositiveButton("OK", null)
-                            .show();
-                }
+                if (showErrors) showAudioSaveError(e);
                 return null;
             }
         } else {
@@ -1797,14 +1834,222 @@ public class MainActivity extends Activity {
         }
         saved.id = db.insertRecording(saved);
         if (saved.id <= 0) {
-            if (saved.path != null && !saved.path.isEmpty()) {
-                File copied = new File(saved.path);
-                if (copied.isFile()) copied.delete();
-            }
+            if (validAudioPath(saved.path)) new File(saved.path).delete();
             if (showErrors) toast("The conversation could not be added to Saved.");
             return null;
         }
         return saved;
+    }
+
+    private void showAudioSaveError(IOException e) {
+        new AlertDialog.Builder(this)
+                .setTitle("Audio could not be saved")
+                .setMessage("The History conversation is still safe, but its audio could not be copied to Saved. "
+                        + (e.getMessage() == null ? "Please try again." : e.getMessage()))
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
+    private boolean validAudioFile(File file) {
+        return file != null && file.isFile() && file.length() > 1024L;
+    }
+
+    private boolean validAudioPath(String path) {
+        return path != null && !path.trim().isEmpty() && validAudioFile(new File(path));
+    }
+
+    private File resolveAudioFile(Models.RecordingItem item) {
+        return item != null && validAudioPath(item.path) ? new File(item.path) : null;
+    }
+
+    private Models.RecordingItem repairHistoryAudioIfPossible(Models.RecordingItem item, File preferred) {
+        if (item == null || (item.notes != null && item.notes.contains(SAVED_COPY_MARKER))) return item;
+        if (validAudioPath(item.path)) return item;
+        // Typed translations have no audio. Do not accidentally attach an unrelated nearby file.
+        if (!validAudioFile(preferred) && item.durationMs <= 1000L) return item;
+        File candidate = validAudioFile(preferred) ? preferred : findHistoryAudioCandidate(item);
+        if (!validAudioFile(candidate)) return item;
+        try {
+            File protectedAudio = promoteAudioToHistoryStorage(candidate, item.id);
+            item.path = protectedAudio.getAbsolutePath();
+            db.updateRecording(item);
+            if (item.id == currentHistoryId) currentRecordingFile = protectedAudio;
+        } catch (IOException ignored) {
+            // Keep the candidate path when it is already a valid app-private recording. This is
+            // still safer than leaving the database blank and losing playback/export access.
+            item.path = candidate.getAbsolutePath();
+            db.updateRecording(item);
+            if (item.id == currentHistoryId) currentRecordingFile = candidate;
+        }
+        return item;
+    }
+
+    private Models.RecordingItem repairAnyAudioIfPossible(Models.RecordingItem item) {
+        if (item == null || validAudioPath(item.path)) return item;
+        if (item.notes != null && item.notes.contains(SAVED_COPY_MARKER)) {
+            long sourceId = savedSourceId(item.notes);
+            Models.RecordingItem source = sourceId > 0 ? db.getRecording(sourceId) : null;
+            source = repairHistoryAudioIfPossible(source,
+                    source != null && source.id == currentHistoryId ? currentRecordingFile : null);
+            File sourceAudio = resolveAudioFile(source);
+            if (sourceAudio != null) {
+                try {
+                    item.path = copyAudioToSavedStorage(sourceAudio, sourceId);
+                    db.updateRecording(item);
+                } catch (IOException ignored) { }
+            }
+            return item;
+        }
+        return repairHistoryAudioIfPossible(item,
+                item.id == currentHistoryId ? currentRecordingFile : null);
+    }
+
+    private void repairAudioLinks() {
+        List<Models.RecordingItem> items = db.getAllRecordings();
+        for (Models.RecordingItem item : items) {
+            if (item.notes == null || !item.notes.contains(SAVED_COPY_MARKER)) {
+                repairHistoryAudioIfPossible(item, null);
+            }
+        }
+        // A failed v0.9.1 save may already have created a Saved transcript row without audio.
+        // Reattach it automatically from the repaired History source when possible.
+        items = db.getAllRecordings();
+        for (Models.RecordingItem item : items) {
+            if (item.notes != null && item.notes.contains(SAVED_COPY_MARKER)
+                    && !validAudioPath(item.path)) {
+                repairAnyAudioIfPossible(item);
+            }
+        }
+    }
+
+    private File findHistoryAudioCandidate(Models.RecordingItem item) {
+        if (item == null) return null;
+        File historyDir = new File(getFilesDir(), "history_recordings");
+        File exact = newestValidFileWithPrefix(historyDir, "history_" + item.id + "_");
+        if (exact != null) return exact;
+
+        File recordingsDir = new File(getFilesDir(), "recordings");
+        File[] files = recordingsDir.listFiles();
+        if (files == null) return null;
+        File best = null;
+        long bestDifference = Long.MAX_VALUE;
+        Set<String> pathsUsedByOtherRows = new HashSet<>();
+        for (Models.RecordingItem other : db.getAllRecordings()) {
+            if (other.id != item.id && validAudioPath(other.path)) {
+                pathsUsedByOtherRows.add(new File(other.path).getAbsolutePath());
+            }
+        }
+        for (File file : files) {
+            if (!validAudioFile(file) || pathsUsedByOtherRows.contains(file.getAbsolutePath())) continue;
+            long timestamp = timestampFromRecordingName(file.getName());
+            if (timestamp <= 0) timestamp = file.lastModified();
+            long difference = Math.abs(timestamp - item.createdAt);
+            if (difference < bestDifference && difference <= 30L * 60L * 1000L) {
+                bestDifference = difference;
+                best = file;
+            }
+        }
+        return best;
+    }
+
+    private File newestValidFileWithPrefix(File directory, String prefix) {
+        File[] files = directory.listFiles();
+        if (files == null) return null;
+        File newest = null;
+        for (File file : files) {
+            if (!file.getName().startsWith(prefix) || !validAudioFile(file)) continue;
+            if (newest == null || file.lastModified() > newest.lastModified()) newest = file;
+        }
+        return newest;
+    }
+
+    private long timestampFromRecordingName(String name) {
+        if (name == null || !name.startsWith("conversation_")) return -1L;
+        int start = "conversation_".length();
+        int end = name.indexOf('.', start);
+        if (end < 0) end = name.length();
+        try {
+            return Long.parseLong(name.substring(start, end));
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    private long savedSourceId(String notes) {
+        if (notes == null) return -1L;
+        int start = notes.indexOf(SAVED_SOURCE_PREFIX);
+        if (start < 0) return -1L;
+        start += SAVED_SOURCE_PREFIX.length();
+        int end = notes.indexOf(']', start);
+        if (end <= start) return -1L;
+        try {
+            return Long.parseLong(notes.substring(start, end));
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    private File promoteAudioToHistoryStorage(File source, long historyId) throws IOException {
+        if (!validAudioFile(source)) throw new IOException("The recorded audio file is incomplete.");
+        File dir = new File(getFilesDir(), "history_recordings");
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IOException("The protected History audio folder could not be created.");
+        }
+        if (source.getParentFile() != null && source.getParentFile().equals(dir)
+                && source.getName().startsWith("history_" + historyId + "_")) {
+            return source;
+        }
+        String extension = extensionOf(source.getName());
+        File destination = new File(dir, "history_" + historyId + "_"
+                + System.currentTimeMillis() + extension);
+        copyFileVerified(source, destination);
+        return destination;
+    }
+
+    private String extensionOf(String name) {
+        if (name == null) return "";
+        int dot = name.lastIndexOf('.');
+        return dot >= 0 ? name.substring(dot) : "";
+    }
+
+    private void copyFileVerified(File source, File destination) throws IOException {
+        File parent = destination.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("The destination folder could not be created.");
+        }
+        File temporary = new File(destination.getAbsolutePath() + ".part");
+        if (temporary.exists()) temporary.delete();
+        try (FileInputStream input = new FileInputStream(source);
+             FileOutputStream output = new FileOutputStream(temporary)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+            output.flush();
+            try { output.getFD().sync(); } catch (Exception ignored) { }
+        }
+        if (!temporary.isFile() || temporary.length() != source.length() || temporary.length() <= 1024L) {
+            temporary.delete();
+            throw new IOException("The copied audio file was incomplete.");
+        }
+        if (destination.exists() && !destination.delete()) {
+            temporary.delete();
+            throw new IOException("The previous destination file could not be replaced.");
+        }
+        if (!temporary.renameTo(destination)) {
+            try (FileInputStream input = new FileInputStream(temporary);
+                 FileOutputStream output = new FileOutputStream(destination)) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+                output.flush();
+                try { output.getFD().sync(); } catch (Exception ignored) { }
+            }
+            temporary.delete();
+        }
+        if (!validAudioFile(destination) || destination.length() != source.length()) {
+            destination.delete();
+            throw new IOException("The protected audio copy could not be verified.");
+        }
     }
 
     private String cleanSavedNotes(String notes, long sourceId) {
@@ -1819,26 +2064,14 @@ public class MainActivity extends Activity {
     }
 
     private String copyAudioToSavedStorage(File source, long sourceId) throws IOException {
+        if (!validAudioFile(source)) throw new IOException("The source recording is missing or incomplete.");
         File dir = new File(getFilesDir(), "saved_recordings");
         if (!dir.exists() && !dir.mkdirs()) {
             throw new IOException("The Saved audio folder could not be created.");
         }
-        String name = source.getName();
-        String extension = "";
-        int dot = name.lastIndexOf('.');
-        if (dot >= 0) extension = name.substring(dot);
-        File destination = new File(dir, "saved_" + sourceId + "_" + System.currentTimeMillis() + extension);
-        try (FileInputStream input = new FileInputStream(source);
-             FileOutputStream output = new FileOutputStream(destination)) {
-            byte[] buffer = new byte[64 * 1024];
-            int read;
-            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
-            output.flush();
-        }
-        if (!destination.isFile() || destination.length() != source.length()) {
-            destination.delete();
-            throw new IOException("The copied audio file was incomplete.");
-        }
+        File destination = new File(dir, "saved_" + sourceId + "_"
+                + System.currentTimeMillis() + extensionOf(source.getName()));
+        copyFileVerified(source, destination);
         return destination.getAbsolutePath();
     }
 
@@ -1936,8 +2169,13 @@ public class MainActivity extends Activity {
         }
         item.title = clean(conversationTitle.getText().toString(), "Conversation " + formatDate(System.currentTimeMillis()));
         item.category = clean(conversationCategory.getText().toString(), "General");
-        item.path = currentRecordingFile != null
-                ? currentRecordingFile.getAbsolutePath() : "";
+        // Never replace a working History audio path with an empty path. The old code did this
+        // during late callbacks and page changes, which made Open, MP3 and MP4 stop working.
+        if (validAudioFile(currentRecordingFile)) {
+            item.path = currentRecordingFile.getAbsolutePath();
+        } else if (!validAudioPath(item.path)) {
+            item.path = "";
+        }
         item.sourceLanguage = liveLanguageA;
         item.targetLanguage = liveLanguageB;
         item.transcript = conversationTranscript.getText().toString().trim();
@@ -1948,18 +2186,29 @@ public class MainActivity extends Activity {
         item.notes = HISTORY_ONLY_MARKER;
         if (item.id == 0) {
             currentHistoryId = db.insertRecording(item);
+            item.id = currentHistoryId;
         } else {
             db.updateRecording(item);
             currentHistoryId = item.id;
         }
+        // If the user saved while the last translation was still finishing, keep the Saved copy's
+        // text in sync without touching its independent protected audio path.
+        Models.RecordingItem savedCopy = db.getSavedCopyForSource(currentHistoryId);
+        if (savedCopy != null) {
+            savedCopy.title = item.title;
+            savedCopy.category = item.category;
+            savedCopy.sourceLanguage = item.sourceLanguage;
+            savedCopy.targetLanguage = item.targetLanguage;
+            savedCopy.transcript = item.transcript;
+            savedCopy.translation = item.translation;
+            savedCopy.pinyin = item.pinyin;
+            savedCopy.durationMs = item.durationMs;
+            db.updateRecording(savedCopy);
+        }
     }
 
     private Models.RecordingItem findCurrentHistoryItem() {
-        if (currentHistoryId == 0) return null;
-        for (Models.RecordingItem item : db.getHistory("")) {
-            if (item.id == currentHistoryId) return item;
-        }
-        return null;
+        return currentHistoryId == 0 ? null : db.getRecording(currentHistoryId);
     }
 
     private void showTextHistory(Models.RecordingItem item) {
@@ -1993,10 +2242,12 @@ public class MainActivity extends Activity {
     }
 
     private void showAudioPlayer(Models.RecordingItem item) {
-        File file = item.path == null || item.path.trim().isEmpty() ? null : new File(item.path);
+        final Models.RecordingItem playerItem = repairAnyAudioIfPossible(item);
+        File file = playerItem.path == null || playerItem.path.trim().isEmpty()
+                ? null : new File(playerItem.path);
         if (file == null || !file.isFile() || file.length() <= 1024L) {
             String message;
-            if (item.path == null || item.path.trim().isEmpty()) {
+            if (playerItem.path == null || playerItem.path.trim().isEmpty()) {
                 message = "No reusable audio file was created for this conversation. This commonly happens when Google Online owns the microphone on the phone. Use Offline Whisper for conversations where the recording must always be retained.";
             } else {
                 message = "The linked audio file is missing or incomplete. The transcript is still available, but this recording cannot be played.";
@@ -2005,24 +2256,24 @@ public class MainActivity extends Activity {
                     .setTitle("Audio unavailable")
                     .setMessage(message)
                     .setNegativeButton("Close", null)
-                    .setPositiveButton("View transcript", (dialog, which) -> showTextHistory(item))
+                    .setPositiveButton("View transcript", (dialog, which) -> showTextHistory(playerItem))
                     .show();
             return;
         }
         LinearLayout body = vertical();
         body.setPadding(dp(18), dp(10), dp(18), 0);
-        TextView original = text(item.transcript.isEmpty() ? "No original subtitle has been added." : ensureTranscriptNumbering(item.transcript), 18, TEXT, true);
-        TextView py = text(ensureTranscriptNumbering(item.pinyin), 15, RED, false);
+        TextView original = text(playerItem.transcript.isEmpty() ? "No original subtitle has been added." : ensureTranscriptNumbering(playerItem.transcript), 18, TEXT, true);
+        TextView py = text(ensureTranscriptNumbering(playerItem.pinyin), 15, RED, false);
         py.setTypeface(Typeface.create("sans", Typeface.ITALIC));
-        TextView translated = text(item.translation.isEmpty() ? "No translated subtitle has been added." : ensureTranscriptNumbering(item.translation), 16, TEXT, false);
+        TextView translated = text(playerItem.translation.isEmpty() ? "No translated subtitle has been added." : ensureTranscriptNumbering(playerItem.translation), 16, TEXT, false);
         body.addView(text("ORIGINAL SUBTITLE", 11, BLUE, true));
         body.addView(original, marginTop(matchWrap(), 5));
-        if (!item.pinyin.isEmpty()) body.addView(py, marginTop(matchWrap(), 5));
+        if (!playerItem.pinyin.isEmpty()) body.addView(py, marginTop(matchWrap(), 5));
         body.addView(text("TRANSLATION", 11, RED, true), marginTop(matchWrap(), 14));
         body.addView(translated, marginTop(matchWrap(), 5));
 
         SeekBar seek = new SeekBar(this);
-        TextView time = text("00:00 / " + formatDuration(item.durationMs), 13, MUTED, false);
+        TextView time = text("00:00 / " + formatDuration(playerItem.durationMs), 13, MUTED, false);
         time.setGravity(Gravity.CENTER);
         body.addView(seek, marginTop(matchWrap(), 14));
         body.addView(time);
@@ -2054,7 +2305,7 @@ public class MainActivity extends Activity {
         ScrollView scroll = new ScrollView(this);
         scroll.addView(body);
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle(item.title)
+                .setTitle(playerItem.title)
                 .setView(scroll)
                 .setNegativeButton("Close", null)
                 .create();
@@ -2064,7 +2315,7 @@ public class MainActivity extends Activity {
         final float[] playbackSpeed = {1f};
         final Runnable[] updater = new Runnable[1];
         try {
-            player.setDataSource(item.path);
+            player.setDataSource(playerItem.path);
             player.prepare();
             seek.setMax(player.getDuration());
             time.setText("00:00 / " + formatDuration(player.getDuration()));
@@ -2102,8 +2353,8 @@ public class MainActivity extends Activity {
                 toast("Playback speed is not supported on this phone.");
             }
         });
-        mp3.setOnClickListener(v -> exportMp3(item));
-        karaoke.setOnClickListener(v -> exportKaraokeMp4(item));
+        mp3.setOnClickListener(v -> exportMp3(playerItem));
+        karaoke.setOnClickListener(v -> exportKaraokeMp4(playerItem));
         seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 if (fromUser) player.seekTo(progress);
@@ -2137,6 +2388,11 @@ public class MainActivity extends Activity {
     }
 
     private void startExport(Models.RecordingItem item, boolean karaoke) {
+        final Models.RecordingItem exportItem = repairAnyAudioIfPossible(item);
+        if (!validAudioPath(exportItem.path)) {
+            toast("The audio recording is missing, so this file cannot be exported.");
+            return;
+        }
         LinearLayout body = dialogBody();
         TextView status = text(karaoke ? "Preparing the karaoke video…" : "Preparing the MP3…", 15, TEXT, true);
         ProgressBar progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
@@ -2171,7 +2427,7 @@ public class MainActivity extends Activity {
                         .show();
             }
         };
-        if (karaoke) exportManager.exportKaraokeMp4(item, callback); else exportManager.exportMp3(item, callback);
+        if (karaoke) exportManager.exportKaraokeMp4(exportItem, callback); else exportManager.exportMp3(exportItem, callback);
     }
 
     private void showExportComplete(Uri uri, String displayName, String mimeType) {
@@ -2870,25 +3126,35 @@ public class MainActivity extends Activity {
     }
 
     private void showSaveHistoryDialog(Models.RecordingItem item, Runnable refresh) {
-        if (db.hasSavedCopyForSource(item.id)) {
-            toast("This conversation is already in Saved.");
+        item = repairHistoryAudioIfPossible(item,
+                item.id == currentHistoryId ? currentRecordingFile : null);
+        Models.RecordingItem existingSaved = db.getSavedCopyForSource(item.id);
+        boolean hasAudio = validAudioPath(item.path);
+        boolean existingHasAudio = existingSaved != null && validAudioPath(existingSaved.path);
+        if (existingHasAudio) {
+            toast("This conversation and its audio are already in Saved.");
             return;
         }
-        boolean hasAudio = item.path != null && !item.path.trim().isEmpty()
-                && new File(item.path).isFile() && new File(item.path).length() > 1024L;
-        String message = hasAudio
-                ? "A separate copy of the conversation and audio will be created. The original History audio will remain untouched."
-                : "This conversation has no reusable audio file. Its transcript and translation will still be saved.";
+        String title = existingSaved == null ? "Save conversation" : "Repair Saved audio";
+        String message;
+        if (existingSaved != null && hasAudio) {
+            message = "The Saved transcript exists, but its audio link is missing. A fresh protected audio copy will be created from History.";
+        } else if (hasAudio) {
+            message = "A separate copy of the conversation and audio will be created. The original History audio will remain untouched.";
+        } else {
+            message = "This conversation has no reusable audio file. Its transcript and translation can still be saved.";
+        }
+        final Models.RecordingItem sourceItem = item;
         new AlertDialog.Builder(this)
-                .setTitle("Save conversation")
+                .setTitle(title)
                 .setMessage(message)
                 .setNegativeButton("Cancel", null)
-                .setPositiveButton("Save", (dialog, which) -> {
-                    Models.RecordingItem saved = createSavedCopy(item, true);
+                .setPositiveButton(existingSaved == null ? "Save" : "Repair", (dialog, which) -> {
+                    Models.RecordingItem saved = createSavedCopy(sourceItem, true);
                     if (saved == null) return;
-                    toast(saved.path == null || saved.path.isEmpty()
-                            ? "Conversation saved without audio."
-                            : "Conversation and audio copied to Saved.");
+                    toast(validAudioPath(saved.path)
+                            ? "Conversation and audio are available in Saved."
+                            : "Conversation saved without audio.");
                     persistentPages.remove("saved");
                     persistentPages.remove("history");
                     refresh.run();

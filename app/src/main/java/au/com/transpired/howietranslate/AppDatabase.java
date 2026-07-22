@@ -121,6 +121,29 @@ final class AppDatabase extends SQLiteOpenHelper {
         getWritableDatabase().update("recordings", recordingValues(item), "id=?", new String[]{String.valueOf(item.id)});
     }
 
+    Models.RecordingItem getRecording(long id) {
+        if (id <= 0) return null;
+        Cursor c = getReadableDatabase().query("recordings", null, "id=?",
+                new String[]{String.valueOf(id)}, null, null, null, "1");
+        try {
+            return c.moveToFirst() ? readRecording(c) : null;
+        } finally {
+            c.close();
+        }
+    }
+
+    List<Models.RecordingItem> getAllRecordings() {
+        Cursor c = getReadableDatabase().query("recordings", null, null, null,
+                null, null, "created_at ASC, id ASC");
+        List<Models.RecordingItem> list = new ArrayList<>();
+        try {
+            while (c.moveToNext()) list.add(readRecording(c));
+        } finally {
+            c.close();
+        }
+        return list;
+    }
+
     void deleteRecording(long id) {
         getWritableDatabase().delete("recordings", "id=?", new String[]{String.valueOf(id)});
     }

@@ -1,54 +1,16 @@
-# Howie Translate 0.9.1 Saved Audio Reliability Build
+# Howie Translate 0.9.2 Durable Conversation Audio Build
 
-Howie Translate is an Android translation, live-conversation, OCR, history and saved-recording app.
+This Android source project fixes the Conversation, History and Saved audio lifecycle.
 
-## Languages
+## Main changes
+- Conversation **Save to Saved** becomes available immediately after recording stops.
+- History receives a protected, durable audio copy.
+- Saved receives a separate verified audio copy.
+- Valid audio paths are never overwritten by blank late callbacks.
+- Previous transcript-only Saved rows can be repaired from their History source.
+- Open, MP3 and MP4 actions attempt safe audio-link recovery before failing.
 
-- English
-- Mandarin Chinese
-- Vietnamese
-- Thai
-- Malay
-- Cantonese (best effort)
-- Teo Chew (best effort)
+## Building with GitHub Actions
+Upload the contents of this folder to the root of the existing private GitHub repository and push to `main`. The included workflow builds and publishes `Howie-Translate-v0.9.2-test.apk` as a GitHub Actions artifact.
 
-ML Kit provides dedicated on-device translation models for English, Chinese, Vietnamese, Thai and Malay. Cantonese and Teo Chew use the Chinese writing model because ML Kit does not provide separate translation models for those dialects.
-
-## Stability changes
-
-- Translation-model checks and translations have timeouts so the interface cannot remain on Preparing forever.
-- Settings downloads translation models sequentially, one language at a time.
-- Live Conversation returns to an actionable error state when a language model cannot be prepared.
-- The Settings status identifies the language currently being checked or downloaded.
-
-## Image translation
-
-- Camera and uploaded images are processed at full resolution.
-- Mandarin Chinese, Cantonese and Teo Chew use the bundled Chinese-script OCR model.
-- Latin-script languages use the bundled Latin OCR model.
-- Unrelated lines that do not match the selected script are filtered out.
-- OCR text is editable in a review window before it is placed into Translate.
-- Thai typed, pasted and speech translation is supported. Thai-script OCR is not included in the current ML Kit OCR libraries used by this build.
-
-
-## Saved audio reliability
-
-- Save to Saved works for audio and transcript-only conversations.
-- Saved receives a separate physical audio copy; History keeps the original.
-- Offline Whisper is the default Conversation engine because it guarantees a local recording.
-- Google Online attempts an additional M4A recording where the phone permits concurrent microphone capture.
-- History and Saved identify whether audio is available.
-
-## Existing features
-
-- Google Online speech with Offline Whisper fallback
-- Numbered bilingual transcripts and Mandarin pinyin
-- Automatic History plus deliberate Saved conversations and recordings
-- Separate MP3 and MP4 export folders
-- MP3 and karaoke MP4 export
-- Searchable History and glossary
-- Re-translate a History conversation into another supported language
-
-## Building
-
-The project is an Android Gradle project. It uses Java 17, Android SDK 35 and Gradle 8.10.2. The included GitHub Actions workflow builds a debug APK and uploads it as an artifact.
+See `GITHUB_UPLOAD_INSTRUCTIONS.txt` for the simple upload steps and `CHANGELOG_v0.9.2.md` for technical details.
